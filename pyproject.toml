@@ -1,0 +1,73 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "landrecords-card-reader"
+version = "0.1.0"
+description = "Extract structured property data from assessment card PDFs using LLM-powered text extraction"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [
+    { name = "Travis Webb", email = "me@traviswebb.com" },
+]
+keywords = ["property", "real-estate", "pdf", "extraction", "ollama", "llm", "assessment", "parcel"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Text Processing :: General",
+    "Topic :: Office/Business",
+]
+
+dependencies = [
+    "httpx>=0.27.0",
+    "PyMuPDF>=1.24.0",
+    "pymupdf4llm>=0.0.17",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+ocr = [
+    "pytesseract>=0.3.10",
+    "Pillow>=10.0.0",
+]
+html = [
+    "pdfkit>=1.0.0",
+]
+graph = [
+    "langgraph>=0.2.0",
+]
+all = [
+    "landrecords-card-reader[ocr,html,graph]",
+]
+dev = [
+    "landrecords-card-reader[all]",
+    "pytest>=8.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/tjwebb/landrecords-card-reader"
+Repository = "https://github.com/tjwebb/landrecords-card-reader"
+Issues = "https://github.com/tjwebb/landrecords-card-reader/issues"
+
+[project.scripts]
+landrecords-card-reader = "landrecords_card_reader.main:main"
+
+[tool.setuptools]
+packages = ["landrecords_card_reader", "landrecords_card_reader.tests"]
+
+[tool.setuptools.package-dir]
+"landrecords_card_reader" = "src"
+"landrecords_card_reader.tests" = "src/tests"
+
+[tool.pytest.ini_options]
+log_cli = true
+log_cli_level = "INFO"
+log_cli_format = "%(asctime)s %(name)s %(levelname)s %(message)s"
+log_cli_date_format = "%Y-%m-%d %H:%M:%S"
+testpaths = ["landrecords_card_reader/tests"]
