@@ -96,7 +96,7 @@ Set via environment variables or a `.env` file:
 
 ## Extracted fields
 
-The extraction prompt maps over 80 property-card fields including:
+The extraction prompt maps over 80 property card fields including:
 
 - **Identity**: parcelid, taxacctnum, taxyear
 - **Owner**: ownername, owneraddr, ownercity, ownerstate, ownerzip
