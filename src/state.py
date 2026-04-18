@@ -9,3 +9,4 @@ class AgentState(TypedDict):
     property_photos: list[dict[str, Any]]
     property_data: dict[str, Any]
     result: str
+    context: str | None

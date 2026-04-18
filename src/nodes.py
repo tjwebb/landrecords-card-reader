@@ -9,8 +9,6 @@ from .config import (
     CLASSIFICATION_CONTEXT_LENGTH,
     EXTRACTION_CONTEXT_LENGTH,
     EXTRACTION_MODEL,
-    GEMINI_API_KEY,
-    GEMINI_MODEL,
     OLLAMA_BASE_URL,
     PHOTO_CLASSIFICATION_MODEL,
 )
@@ -206,7 +204,7 @@ DOCUMENT TEXT:
 # ---------------------------------------------------------------------------
 
 
-def _stream_ollama(messages: list[dict], *, label: str = "extraction") -> str:
+def _stream_llm(messages: list[dict], *, label: str = "extraction") -> str:
     """Stream a chat completion from Ollama and return the full response text."""
     stream_to_console = logger.isEnabledFor(logging.DEBUG)
 
@@ -262,108 +260,6 @@ def _stream_ollama(messages: list[dict], *, label: str = "extraction") -> str:
         logger.info("Ollama %s complete (%d response chars)", label, len(full_text))
 
     return full_text
-
-
-def _stream_gemini(messages: list[dict], *, label: str = "extraction") -> str:
-    """Stream a chat completion from the Gemini API and return the full response text."""
-    stream_to_console = logger.isEnabledFor(logging.DEBUG)
-
-    # Convert Ollama-style messages to Gemini format.
-    # Gemini uses "user"/"model" roles; system instructions go in a separate field.
-    system_parts: list[str] = []
-    contents: list[dict] = []
-    for msg in messages:
-        role = msg.get("role", "user")
-        if role == "system":
-            system_parts.append(msg["content"])
-            continue
-
-        gemini_role = "model" if role == "assistant" else "user"
-        parts: list[dict] = [{"text": msg["content"]}]
-
-        # Attach images (base64) if present — Gemini uses inline_data.
-        for img_b64 in msg.get("images", []):
-            parts.append({
-                "inline_data": {
-                    "mime_type": "image/jpeg",
-                    "data": img_b64,
-                },
-            })
-
-        contents.append({"role": gemini_role, "parts": parts})
-
-    payload: dict = {
-        "contents": contents,
-        "generationConfig": {
-            "thinkingConfig": {"thinkingBudget": 0},
-        },
-    }
-    if system_parts:
-        payload["system_instruction"] = {
-            "parts": [{"text": t} for t in system_parts],
-        }
-
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{GEMINI_MODEL}:streamGenerateContent?alt=sse&key={GEMINI_API_KEY}"
-    )
-
-    if stream_to_console:
-        sys.stderr.write(f"gemini ({label})> ")
-        sys.stderr.flush()
-
-    chunks: list[str] = []
-    prompt_tokens = 0
-    output_tokens = 0
-
-    with httpx.Client(timeout=300) as client:
-        with client.stream("POST", url, json=payload) as resp:
-            resp.raise_for_status()
-            for line in resp.iter_lines():
-                if not line.startswith("data: "):
-                    continue
-                data = json.loads(line[6:])
-
-                # Accumulate text from candidates.
-                for candidate in data.get("candidates", []):
-                    for part in candidate.get("content", {}).get("parts", []):
-                        token = part.get("text", "")
-                        if token:
-                            chunks.append(token)
-                            if stream_to_console:
-                                sys.stderr.write(token)
-                                sys.stderr.flush()
-
-                # Capture usage from the final chunk.
-                usage = data.get("usageMetadata")
-                if usage:
-                    prompt_tokens = usage.get("promptTokenCount", 0)
-                    output_tokens = usage.get("candidatesTokenCount", 0)
-
-    if stream_to_console:
-        sys.stderr.write("\n")
-        sys.stderr.flush()
-
-    full_text = "".join(chunks)
-    total_tokens = prompt_tokens + output_tokens
-
-    if prompt_tokens or output_tokens:
-        logger.info(
-            "Gemini %s complete: %d prompt tokens + %d output tokens = %d total "
-            "(%d response chars)",
-            label, prompt_tokens, output_tokens, total_tokens, len(full_text),
-        )
-    else:
-        logger.info("Gemini %s complete (%d response chars)", label, len(full_text))
-
-    return full_text
-
-
-def _stream_llm(messages: list[dict], *, label: str = "extraction") -> str:
-    """Route to Gemini or Ollama based on whether GEMINI_API_KEY is set."""
-    if GEMINI_API_KEY:
-        return _stream_gemini(messages, label=label)
-    return _stream_ollama(messages, label=label)
 
 
 def _parse_json_response(text: str) -> dict:
@@ -769,13 +665,18 @@ def extract_property_photos(state: AgentState) -> dict:
     return {"property_photos": photos}
 
 
-def _run_extraction_llm(source_text: str) -> dict:
+def _run_extraction_llm(source_text: str, context: str | None = None) -> dict:
     """Run the extraction LLM on a body of text and return coerced property data.
 
     Streams the response from Ollama and emits each chunk to the DEBUG log as
     it arrives, so you can watch generation progress with --log-cli-level=DEBUG.
+
+    If ``context`` is provided, it is appended to the extraction prompt as
+    additional caller-supplied instructions.
     """
     prompt = EXTRACTION_PROMPT.format(document_text=source_text)
+    if context and context.strip():
+        prompt = f"{prompt}\n\nAdditional instructions:\n{context.strip()}"
     logger.info("Extracting structured data (model=%s)", EXTRACTION_MODEL)
 
     messages = [
@@ -799,44 +700,12 @@ def _run_extraction_llm(source_text: str) -> dict:
     return _coerce_types(raw)
 
 
-RECONCILE_PROMPT = """\
-A property card was parsed and produced these three monetary values:
-    landvalue = {landvalue}
-    imprvalue = {imprvalue}
-    totalvalue = {totalvalue}
-
-These are INCONSISTENT because landvalue + imprvalue ({sum}) does NOT equal
-totalvalue ({totalvalue}).
-
-Re-read the property card text below and return the CORRECT values. They must
-satisfy: landvalue + imprvalue == totalvalue.
-
-Labels to look for:
-  - landvalue: "Land", "Land Value", "Total Land Value", "Total Assessed Land"
-  - imprvalue: "Improvements", "Building", "Bldg", "Improvement Value",
-               "Total Building Value", "Total Assessed Bldg", "Building Value"
-               — this must roll up ALL building-related value on the parcel
-               (main building plus outbuildings, extra features, other
-               structures). If the card breaks these out separately (e.g.
-               "Build" + "Other"), sum them into imprvalue.
-  - totalvalue: "Total", "Total Value", "Total Assessed", "Total Market Value"
-
-Return ONLY a JSON object like:
-  {{"landvalue": <int>, "imprvalue": <int>, "totalvalue": <int>}}
-No $ signs, no commas, no explanation.
-
-PROPERTY CARD TEXT:
-{document_text}
-"""
-
-
-def _reconcile_value_totals(data: dict, markdown: str) -> dict:
+def _reconcile_value_totals(data: dict) -> dict:
     """Ensure landvalue + imprvalue == totalvalue.
 
-    1. If exactly one of the three is missing but the other two are present,
-       compute the missing value arithmetically (no LLM call needed).
-    2. If all three are present but inconsistent, re-query the LLM.
-    3. If fewer than two are present, nothing to reconcile — return as-is.
+    If exactly one of the three is missing but the other two are present,
+    compute the missing value arithmetically. If all three are present but
+    inconsistent, log a warning and keep the extracted values as-is.
     """
     land = data.get("landvalue")
     impr = data.get("imprvalue")
@@ -847,7 +716,6 @@ def _reconcile_value_totals(data: dict, markdown: str) -> dict:
     have_total = isinstance(total, int)
     present = have_land + have_impr + have_total
 
-    # Fill in a missing value when the other two are known.
     if present == 2:
         if not have_total:
             data["totalvalue"] = land + impr
@@ -863,58 +731,12 @@ def _reconcile_value_totals(data: dict, markdown: str) -> dict:
     if present < 3:
         return data
 
-    # All three present — check consistency.
-    if land + impr == total:
-        return data
-
-    logger.warning(
-        "Value totals inconsistent: land=%d + impr=%d = %d != total=%d; "
-        "re-querying LLM to reconcile",
-        land, impr, land + impr, total,
-    )
-
-    prompt = RECONCILE_PROMPT.format(
-        landvalue=land, imprvalue=impr, totalvalue=total,
-        sum=land + impr, document_text=markdown,
-    )
-
-    full_text = _stream_llm(
-        [{"role": "user", "content": prompt}],
-        label="reconcile",
-    )
-    try:
-        raw = _parse_json_response(full_text)
-    except json.JSONDecodeError:
-        logger.warning("Reconcile LLM returned non-JSON; keeping original values")
-        return data
-
-    new = _coerce_types(raw)
-    new_land = new.get("landvalue")
-    new_impr = new.get("imprvalue")
-    new_total = new.get("totalvalue")
-
-    if not (isinstance(new_land, int) and isinstance(new_impr, int) and isinstance(new_total, int)):
+    if land + impr != total:
         logger.warning(
-            "Reconcile returned non-integer values land=%r impr=%r total=%r; "
-            "keeping original", new_land, new_impr, new_total,
+            "Value totals inconsistent: land=%d + impr=%d = %d != total=%d; "
+            "keeping extracted values",
+            land, impr, land + impr, total,
         )
-        return data
-
-    if new_land + new_impr != new_total:
-        logger.warning(
-            "Reconcile still inconsistent: land=%d + impr=%d = %d != total=%d; "
-            "keeping original",
-            new_land, new_impr, new_land + new_impr, new_total,
-        )
-        return data
-
-    logger.info(
-        "Reconciled values: land %d->%d, impr %d->%d, total %d->%d",
-        land, new_land, impr, new_impr, total, new_total,
-    )
-    data["landvalue"] = new_land
-    data["imprvalue"] = new_impr
-    data["totalvalue"] = new_total
     return data
 
 
@@ -940,14 +762,14 @@ PROPERTY CARD TEXT:
 
 
 def _retry_parcelid(data: dict, markdown: str) -> dict:
-    """If the extracted parcelid is fewer than 5 characters, re-query the LLM
-    with a focused prompt to find a better one."""
+    """If the extracted parcelid is fewer than 3 characters, re-query the LLM
+    once with a focused prompt to find a better one."""
     pid = data.get("parcelid")
-    if not isinstance(pid, str) or len(pid) >= 5:
+    if not isinstance(pid, str) or len(pid) >= 3:
         return data
 
     logger.warning(
-        "parcelid %r is fewer than 5 chars; re-querying LLM for a better match",
+        "parcelid %r is fewer than 3 chars; re-querying LLM for a better match",
         pid,
     )
 
@@ -965,7 +787,7 @@ def _retry_parcelid(data: dict, markdown: str) -> dict:
         return data
 
     new_pid = raw.get("parcelid")
-    if isinstance(new_pid, str) and len(new_pid) >= 5:
+    if isinstance(new_pid, str) and len(new_pid) >= 3:
         logger.info("parcelid corrected: %r -> %r", pid, new_pid.upper())
         data["parcelid"] = new_pid.strip().upper()
     else:
@@ -1018,33 +840,27 @@ def fill_from_photo(data: dict, image_bytes: bytes) -> dict:
     logger.info("Analyzing property photo for %d missing field(s)", len(missing))
 
     try:
-        if GEMINI_API_KEY:
-            full_text = _stream_gemini(
-                [{"role": "user", "content": prompt, "images": [b64]}],
-                label="photo-analysis",
+        # Use Ollama directly to set visual_token_budget for gemma4 models.
+        payload = {
+            "model": EXTRACTION_MODEL,
+            "messages": [{"role": "user", "content": prompt, "images": [b64]}],
+            "stream": False,
+            "think": False,
+            "options": {"visual_token_budget": 1120},
+        }
+        if EXTRACTION_CONTEXT_LENGTH:
+            payload["options"]["num_ctx"] = EXTRACTION_CONTEXT_LENGTH
+        with httpx.Client(base_url=OLLAMA_BASE_URL, timeout=300) as client:
+            resp = client.post("/api/chat", json=payload)
+            resp.raise_for_status()
+            result = resp.json()
+            full_text = result.get("message", {}).get("content", "")
+            prompt_tokens = result.get("prompt_eval_count", 0)
+            output_tokens = result.get("eval_count", 0)
+            logger.info(
+                "Ollama photo-analysis complete: %d prompt + %d output = %d total",
+                prompt_tokens, output_tokens, prompt_tokens + output_tokens,
             )
-        else:
-            # Use Ollama directly to set visual_token_budget for gemma4 models.
-            payload = {
-                "model": EXTRACTION_MODEL,
-                "messages": [{"role": "user", "content": prompt, "images": [b64]}],
-                "stream": False,
-                "think": False,
-                "options": {"visual_token_budget": 1120},
-            }
-            if EXTRACTION_CONTEXT_LENGTH:
-                payload["options"]["num_ctx"] = EXTRACTION_CONTEXT_LENGTH
-            with httpx.Client(base_url=OLLAMA_BASE_URL, timeout=300) as client:
-                resp = client.post("/api/chat", json=payload)
-                resp.raise_for_status()
-                result = resp.json()
-                full_text = result.get("message", {}).get("content", "")
-                prompt_tokens = result.get("prompt_eval_count", 0)
-                output_tokens = result.get("eval_count", 0)
-                logger.info(
-                    "Ollama photo-analysis complete: %d prompt + %d output = %d total",
-                    prompt_tokens, output_tokens, prompt_tokens + output_tokens,
-                )
         raw = _parse_json_response(full_text)
         new_fields = _coerce_types(raw)
     except (json.JSONDecodeError, Exception) as e:
@@ -1073,8 +889,8 @@ def extract_data(state: AgentState) -> dict:
         )
         return {"property_data": {}}
 
-    data = _run_extraction_llm(markdown)
-    data = _reconcile_value_totals(data, markdown)
+    data = _run_extraction_llm(markdown, state.get("context"))
+    data = _reconcile_value_totals(data)
     data = _retry_parcelid(data, markdown)
     logger.info("Extracted %d fields from PDF text", len(data))
     return {"property_data": data}

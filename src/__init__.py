@@ -24,6 +24,7 @@ def read_property_card(
     *,
     pdf_bytes: bytes | None = None,
     analyze_photo: bool = False,
+    context: str | None = None,
 ) -> tuple[dict, bytes | None]:
     """Extract property data and the primary photo from a property card PDF.
 
@@ -35,6 +36,8 @@ def read_property_card(
             extraction model to fill in any missing fields that can be
             inferred visually (building type, exterior walls, roof style,
             number of floors, visible features like pools/decks/etc.).
+        context: Optional extra instructions appended to the extraction
+            prompt (e.g. county-specific hints about where to find a field).
 
     Returns:
         ``(property_data, image_bytes)`` where *property_data* is a dict of
@@ -56,6 +59,7 @@ def read_property_card(
         "property_photos": [],
         "property_data": {},
         "result": "",
+        "context": context,
     }
 
     state.update(download_pdf(state))
@@ -77,6 +81,7 @@ def read_property_card_from_url(
     url: str,
     *,
     analyze_photo: bool = False,
+    context: str | None = None,
 ) -> tuple[dict, bytes | None]:
     """Fetch a URL and extract property data, handling both PDF and HTML pages.
 
@@ -88,6 +93,8 @@ def read_property_card_from_url(
         url: URL to a property card PDF or HTML property report page.
         analyze_photo: If True, send the first property photo to the
             extraction model to fill in missing building details.
+        context: Optional extra instructions appended to the extraction
+            prompt. Forwarded to :func:`read_property_card`.
 
     Returns:
         ``(property_data, image_bytes)`` — same as :func:`read_property_card`.
@@ -104,4 +111,9 @@ def read_property_card_from_url(
     if not _is_pdf(content):
         content = _html_to_pdf(content, url)
 
-    return read_property_card(url, pdf_bytes=content, analyze_photo=analyze_photo)
+    return read_property_card(
+        url,
+        pdf_bytes=content,
+        analyze_photo=analyze_photo,
+        context=context,
+    )

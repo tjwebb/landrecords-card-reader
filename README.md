@@ -90,8 +90,6 @@ Set via environment variables or a `.env` file:
 | `PHOTO_CLASSIFICATION_MODEL` | `gemma4:e2b` | Lightweight vision model for photo classification |
 | `EXTRACTION_CONTEXT_LENGTH` | (model default) | Override Ollama context window for extraction |
 | `CLASSIFICATION_CONTEXT_LENGTH` | (model default) | Override Ollama context window for photo classification |
-| `GEMINI_API_KEY` | (none) | Use Google Gemini API instead of Ollama |
-| `GEMINI_MODEL` | `gemini-3-flash` | Gemini model name (when using Gemini) |
 
 
 ## Extracted fields
