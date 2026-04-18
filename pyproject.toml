@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "landrecords-card-reader"
-version = "0.2.3"
+version = "0.2.4"
 description = "Extract structured property data from assessment card PDFs using LLM-powered text extraction"
 readme = "README.md"
 license = "MIT"
@@ -26,6 +26,7 @@ classifiers = [
 
 dependencies = [
     "httpx>=0.27.0",
+    "pdfkit>=1.0.0",
     "PyMuPDF>=1.24.0",
     "pymupdf4llm>=0.0.17",
     "python-dotenv>=1.0.0",
@@ -36,14 +37,11 @@ ocr = [
     "pytesseract>=0.3.10",
     "Pillow>=10.0.0",
 ]
-html = [
-    "pdfkit>=1.0.0",
-]
 graph = [
     "langgraph>=0.2.0",
 ]
 all = [
-    "landrecords-card-reader[ocr,html,graph]",
+    "landrecords-card-reader[ocr,graph]",
 ]
 dev = [
     "landrecords-card-reader[all]",
