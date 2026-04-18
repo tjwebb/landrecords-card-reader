@@ -103,7 +103,7 @@ def read_property_card_from_url(
 
     from .nodes import _html_to_pdf, _is_pdf
 
-    with httpx.Client(timeout=60, follow_redirects=True) as client:
+    with httpx.Client(timeout=60, follow_redirects=True, verify=False) as client:
         resp = client.get(url)
         resp.raise_for_status()
     content = resp.content

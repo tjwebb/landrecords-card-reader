@@ -2,8 +2,19 @@ import json
 import logging
 import re
 import sys
+import warnings
 
 import httpx
+
+# County assessor sites often ship broken/expired certs. Silence the
+# verify=False noise so it doesn't clutter logs.
+warnings.filterwarnings("ignore", message="Unverified HTTPS request")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="ssl")
+try:
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+except ImportError:
+    pass
 
 from .config import (
     CLASSIFICATION_CONTEXT_LENGTH,
@@ -330,11 +341,33 @@ def _is_pdf(content: bytes) -> bool:
 
 
 def _html_to_pdf(html: bytes, url: str) -> bytes:
-    """Convert HTML content to PDF using pdfkit (wkhtmltopdf)."""
+    """Convert HTML content to PDF using pdfkit (wkhtmltopdf).
+
+    Feeds the already-fetched HTML to wkhtmltopdf via stdin so it doesn't
+    re-download the page (and so we don't need cert-bypass flags for the
+    main URL). A ``<base href="...">`` tag is injected so wkhtmltopdf can
+    resolve relative/protocol-relative URLs for sub-resources; any
+    sub-resources that still fail are ignored via ``load-error-handling``.
+    """
     import pdfkit
 
     logger.info("URL returned HTML; converting to PDF via pdfkit")
-    return pdfkit.from_url(url, False)
+    html_str = html.decode("utf-8", errors="replace")
+
+    base_tag = f'<base href="{url}">'
+    if re.search(r"<head[^>]*>", html_str, flags=re.IGNORECASE):
+        html_str = re.sub(
+            r"(<head[^>]*>)", r"\1" + base_tag, html_str, count=1, flags=re.IGNORECASE,
+        )
+    else:
+        html_str = base_tag + html_str
+
+    options = {
+        "load-error-handling": "ignore",
+        "load-media-error-handling": "ignore",
+        "quiet": "",
+    }
+    return pdfkit.from_string(html_str, False, options=options)
 
 
 def download_pdf(state: AgentState) -> dict:
@@ -350,7 +383,7 @@ def download_pdf(state: AgentState) -> dict:
     else:
         url = state["pdf_url"]
         logger.info("Downloading PDF from %s", url)
-        with httpx.Client(timeout=60, follow_redirects=True) as client:
+        with httpx.Client(timeout=60, follow_redirects=True, verify=False) as client:
             resp = client.get(url)
             resp.raise_for_status()
         content = resp.content
