@@ -101,7 +101,7 @@ The extraction prompt maps over 80 property card fields including:
 - **Location**: parceladdr, parcelcity, parcelstate, parcelzip, legaldesc
 - **Valuation**: landvalue, imprvalue, totalvalue, assessedvalue, appraisedvalue
 - **Building**: yearbuilt, bldgsqft, bedrooms, fullbaths, halfbaths, bldgtype
-- **Construction**: foundation, roofcover, extwall, heating, cooling
+- **Construction**: foundation, roofcover, extwall, heating, heatfuel, cooling
 - **Sale**: saleamt, saledate
 - **Zoning**: zoningcode, zoningdesc, zoningtype
 

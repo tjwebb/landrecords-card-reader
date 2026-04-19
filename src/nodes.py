@@ -41,7 +41,7 @@ VALID_COLUMNS = {
     "house", "category", "near", "house_number", "road", "unit", "level",
     "bldgtype", "numfloors", "yearremodel", "livingarea", "bldgquality",
     "bldgcondition", "architecture", "totalrooms", "fireplaces", "heating",
-    "cooling", "foundation", "attic", "atticsqft", "intwall", "extwall",
+    "heatfuel", "cooling", "foundation", "attic", "atticsqft", "intwall", "extwall",
     "roofstyle", "roofcover", "roofheight", "fsagpfeet", "siding", "framing",
     "basementsqft", "attgaragesqft", "detgaragesqft", "garagestalls",
     "situsaddress", "appraisedvalue", "assessedvalue",
@@ -148,7 +148,16 @@ Field mapping guide:
 
     totalrooms int4 -- Total number of rooms in the primary building on the parcel.
     fireplaces int4 -- Number of fireplaces in the primary building on the parcel.
-    heating text -- Type of heating system in the primary building on the parcel.
+    heating text -- Type of heating system in the primary building on the parcel
+        (e.g. FORCED AIR, HEAT PUMP, BASEBOARD, RADIANT, WARMED & COOLED AIR).
+        This describes the delivery/system type, NOT the fuel.
+    heatfuel text -- Fuel used by the heating system. Allowed values: GAS, OIL,
+        ELECTRIC, PROPANE, WOOD, SOLAR, COAL, NONE. Infer from any label that
+        names a fuel in the heating/HVAC section, e.g. "Direct-Vented, Gas",
+        "Gas Furnace", "Gas Pack", "Natural Gas" → GAS; "Oil Furnace",
+        "Fuel Oil" → OIL; "Electric Heat", "Heat Pump (Electric)", "Baseboard
+        Electric" → ELECTRIC; "LP", "Propane" → PROPANE; "Wood Stove",
+        "Woodburning" → WOOD.
     cooling text -- Type of cooling system in the primary building on the parcel.
     foundation text -- Type of foundation of the primary building on the parcel.
     attic text -- Type of attic in the primary building on the parcel.
