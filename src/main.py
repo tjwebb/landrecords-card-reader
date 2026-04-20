@@ -40,14 +40,6 @@ def main():
     state.update(extract_pdf_and_photos(state))
     state.update(extract_data(state))
 
-    print("\n=== PDF Markdown ===")
-    print(state["pdf_markdown"])
-
-    print(f"\n=== Property Photos ({len(state['property_photos'])}) ===")
-    for i, p in enumerate(state["property_photos"]):
-        print(f"  [{i}] page={p['page']} {p['width']}x{p['height']} ext={p['ext']} ({len(p['bytes'])} bytes)")
-
-    print("\n=== Extracted Property Data ===")
     print(json.dumps(state["property_data"], indent=2, default=str))
 
 
