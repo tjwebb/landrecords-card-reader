@@ -1,10 +1,20 @@
 import json
 import logging
+import os
 import re
 import sys
 import warnings
 
 import httpx
+
+# Pin Tesseract to single-threaded execution. Tesseract uses OpenMP
+# internally; without this, each invocation spawns its own OMP worker pool
+# and combines with our ThreadPoolExecutor to oversubscribe the CPU. With
+# OMP_THREAD_LIMIT=1, our outer per-page thread pool is the only source of
+# parallelism — predictable, no thrashing. Set before any pytesseract call
+# so the value propagates into the subprocess environment via inheritance.
+# `setdefault` preserves any explicit override the operator may have set.
+os.environ.setdefault("OMP_THREAD_LIMIT", "1")
 
 # County assessor sites often ship broken/expired certs. Silence the
 # verify=False noise so it doesn't clutter logs.
@@ -53,9 +63,10 @@ VALID_COLUMNS = {
 # Extraction prompt template
 # ---------------------------------------------------------------------------
 EXTRACTION_PROMPT = """\
-You are a property data extraction expert. Below is text extracted from a
-property card document. Extract all available property information and return
-ONLY a valid JSON object. DO NOT print any null values.
+You are a property data extraction expert. Below is the raw OCR output of a
+property card document — it may contain layout artifacts, line-broken
+labels, and minor OCR errors. Extract all available property information
+and return ONLY a valid JSON object. DO NOT print any null values.
 
 Field mapping guide:
     parcelid text -- Unique identifier for the parcel, e.g. apn, pid, pin, parcel_number, gpin.
@@ -399,295 +410,117 @@ def download_pdf(state: AgentState) -> dict:
     return {"pdf_content": content}
 
 
-def _iter_text_image_regions(content: bytes):
-    """Yield ``(page_num, idx, ext, image_bytes)`` for each PDF image region
-    that is plausibly text-bearing.
+PDF_OCR_DPI = int(os.getenv("CARD_READER_OCR_DPI", "300"))
 
-    Skips:
-      * images smaller than 30px on either side (no readable glyphs fit), and
-      * images >= 400px on both sides with aspect ratio <= 2 (likely photos).
 
-    Used by both the OCR step and the test suite (which writes each region to
-    disk as a JPG for debugging).
+def _ocr_pdf(content: bytes, dpi: int = PDF_OCR_DPI) -> str:
+    """Render every PDF page and OCR it as a single bitmap.
+
+    Tesseract is the sole text source. We deliberately do NOT mix in
+    pymupdf4llm output or per-image-region OCR — those paths produced
+    fragmented, layout-mangled text on county property cards. Rendering
+    each page at high DPI and OCRing the whole bitmap gives Tesseract the
+    full visual context to associate labels with their adjacent values
+    correctly.
+
+    PDF rendering is serial (PyMuPDF is not thread-safe), but the per-page
+    Tesseract calls run in parallel via a thread pool — pytesseract shells
+    out to the ``tesseract`` binary, so threads only wait on subprocess I/O.
     """
-    import pymupdf as fitz
+    import io
+    from concurrent.futures import ThreadPoolExecutor
 
-    MIN_DIM = 30           # smaller than this can't hold readable glyphs
-    PHOTO_DIM = 400        # both dims this large + near-square = treat as photo
-    PHOTO_ASPECT = 2.0
-    CLIP_DPI = 200         # render dpi for inline (xref=0) image regions
+    import pymupdf as fitz
+    import pytesseract
+    from PIL import Image
 
     doc = fitz.open(stream=content, filetype="pdf")
     try:
+        rendered: list[tuple[int, int, int, bytes]] = []
         for page_num in range(len(doc)):
             page = doc[page_num]
-            seen_xrefs: set[int] = set()
-            idx = 0
-
-            for info in page.get_image_info(xrefs=True):
-                w, h = info.get("width", 0), info.get("height", 0)
-                if w < MIN_DIM or h < MIN_DIM:
-                    continue
-
-                # Skip images that look like property photos.
-                if w >= PHOTO_DIM and h >= PHOTO_DIM:
-                    long_side, short_side = max(w, h), min(w, h)
-                    if short_side > 0 and long_side / short_side <= PHOTO_ASPECT:
-                        continue
-
-                xref = info.get("xref", 0) or 0
-                try:
-                    if xref:
-                        if xref in seen_xrefs:
-                            continue
-                        seen_xrefs.add(xref)
-                        extracted = doc.extract_image(xref)
-                        img_bytes = extracted["image"]
-                        ext = extracted.get("ext", "png")
-                    else:
-                        bbox = info.get("bbox")
-                        if not bbox:
-                            continue
-                        pix = page.get_pixmap(clip=fitz.Rect(bbox), dpi=CLIP_DPI)
-                        img_bytes = pix.tobytes("png")
-                        ext = "png"
-                except Exception as e:
-                    logger.debug("Failed to extract image on page %d: %s", page_num + 1, e)
-                    continue
-
-                yield page_num + 1, idx, ext, img_bytes
-                idx += 1
+            pix = page.get_pixmap(dpi=dpi)
+            rendered.append((page_num, pix.width, pix.height, pix.tobytes("png")))
     finally:
         doc.close()
 
-
-def _ocr_image_regions(content: bytes) -> str:
-    """OCR text that's encoded as image regions inside the PDF.
-
-    Some property cards bake field labels and headings as raster images rather
-    than embedded text — pymupdf4llm cannot read those. This runs Tesseract on
-    each text-bearing image region and returns one markdown section per page
-    containing the joined OCR output.
-
-    Regions are OCR'd in parallel via a thread pool: pytesseract shells out
-    to the ``tesseract`` binary per call, so each invocation is its own OS
-    process and threads exist only to wait on subprocess output. Cards
-    routinely contain 25-100+ small text regions; serial OCR was the bulk
-    of pipeline latency.
-    """
-    import io
-    import os
-    from concurrent.futures import ThreadPoolExecutor
-    try:
-        import pytesseract
-        from PIL import Image
-    except ModuleNotFoundError:
-        logger.debug("pytesseract/Pillow not installed; skipping OCR")
+    if not rendered:
         return ""
 
-    regions = list(_iter_text_image_regions(content))
-    if not regions:
-        return ""
-
-    def _ocr_one(region: tuple) -> tuple:
-        page_num, idx, _ext, img_bytes = region
+    def _ocr_one(item: tuple[int, int, int, bytes]) -> tuple[int, int, int, str]:
+        page_num, w, h, png_bytes = item
         try:
-            img = Image.open(io.BytesIO(img_bytes))
+            img = Image.open(io.BytesIO(png_bytes))
             text = pytesseract.image_to_string(img).strip()
-            return page_num, idx, img.width, img.height, text, None
         except Exception as e:
-            return page_num, idx, 0, 0, "", e
+            logger.warning("OCR failed on page %d: %s", page_num + 1, e)
+            return page_num, w, h, ""
+        return page_num, w, h, text
 
-    # Cap workers at cpu_count — each task spawns a tesseract subprocess so
-    # over-subscription just thrashes. Fall back to 4 if cpu_count is unknown.
-    max_workers = min(len(regions), os.cpu_count() or 4)
+    if len(rendered) == 1:
+        results = [_ocr_one(rendered[0])]
+        worker_count = 1
+    else:
+        worker_count = min(len(rendered), os.cpu_count() or 4)
+        with ThreadPoolExecutor(max_workers=worker_count) as pool:
+            results = list(pool.map(_ocr_one, rendered))
 
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        # ``map`` preserves input order, which keeps OCR text on each page in
-        # the same top-to-bottom order yielded by _iter_text_image_regions.
-        results = list(pool.map(_ocr_one, regions))
-
-    by_page: dict[int, list[str]] = {}
-    region_count = 0
-    for page_num, idx, w, h, text, err in results:
-        if err is not None:
-            logger.debug("OCR failed on page %d image %d: %s", page_num, idx, err)
+    sections: list[str] = []
+    total_chars = 0
+    for page_num, w, h, text in results:
+        if not text:
             continue
-        if text:
-            region_count += 1
-            logger.info(
-                "OCR region p%d#%d (%dx%d) -> %r",
-                page_num, idx, w, h,
-                text if len(text) <= 200 else text[:200] + "…",
-            )
-            by_page.setdefault(page_num, []).append(text)
+        total_chars += len(text)
+        logger.info(
+            "OCR page %d (%dx%d @ %d DPI) -> %d chars:\n%s",
+            page_num + 1, w, h, dpi, len(text), text,
+        )
+        if len(rendered) > 1:
+            sections.append(f"=== Page {page_num + 1} ===\n{text}")
+        else:
+            sections.append(text)
 
-    sections = [
-        f"## Page {page_num} — Image-Encoded Text\n\n" + "\n".join(texts)
-        for page_num, texts in sorted(by_page.items())
-    ]
     combined = "\n\n".join(sections)
     if combined:
         logger.info(
-            "OCR'd image regions: %d region(s) across %d worker(s), "
-            "%d chars across %d page section(s)",
-            region_count, max_workers, len(combined), len(sections),
+            "OCR total: %d chars across %d page(s) using %d worker(s)",
+            total_chars, len(sections), worker_count,
         )
-        logger.info("OCR image-region full text:\n%s", combined)
     return combined
-
-
-def _ocr_full_pages(content: bytes, dpi: int = 300) -> str:
-    """OCR each page by rendering it as a full-page bitmap.
-
-    Falls back when embedded text + image-region OCR miss content — for
-    example, property cards that bake every value (owner, year built, heat
-    fuel, etc.) into a single large rasterized card image, or PDFs whose
-    values are scattered across hundreds of tiny inline images too small for
-    the per-region OCR path to pick up.
-    """
-    import io
-    try:
-        import pymupdf as fitz
-        import pytesseract
-        from PIL import Image
-    except ModuleNotFoundError:
-        logger.debug("pytesseract/Pillow not installed; skipping full-page OCR")
-        return ""
-
-    doc = fitz.open(stream=content, filetype="pdf")
-    sections: list[str] = []
-    try:
-        for page_num in range(len(doc)):
-            page = doc[page_num]
-            try:
-                pix = page.get_pixmap(dpi=dpi)
-                img = Image.open(io.BytesIO(pix.tobytes("png")))
-                text = pytesseract.image_to_string(img).strip()
-            except Exception as e:
-                logger.debug("Full-page OCR failed on page %d: %s", page_num + 1, e)
-                continue
-            if text:
-                logger.info(
-                    "Full-page OCR p%d (%dx%d @ %d DPI) -> %d chars:\n%s",
-                    page_num + 1, img.width, img.height, dpi, len(text), text,
-                )
-                sections.append(f"## Page {page_num + 1} — Full-Page OCR\n\n{text}")
-    finally:
-        doc.close()
-
-    combined = "\n\n".join(sections)
-    if combined:
-        logger.info("Full-page OCR: %d chars across %d page(s)",
-                    len(combined), len(sections))
-    return combined
-
-
-def _extract_markdown(content: bytes) -> str:
-    """Extract embedded text from the PDF and clean it up as markdown."""
-    import pymupdf as fitz
-    import pymupdf4llm
-
-    try:
-        doc = fitz.open(stream=content, filetype="pdf")
-        markdown = pymupdf4llm.to_markdown(doc, use_ocr=False)
-        logger.info("Extracted markdown via pymupdf4llm (%d chars)", len(markdown))
-    except Exception as e:
-        logger.warning("pymupdf4llm extraction failed (%s).", e)
-        return ""
-    finally:
-        doc.close()
-
-    # Deduplicate repeated table cells BEFORE <br> conversion (while cells
-    # are still on single lines). pymupdf4llm sometimes emits the same cell
-    # content once per table column:
-    #   |Owner:<br>230506<br>...|Owner:<br>230506<br>...|
-    # This wastes context and reinforces wrong label→value associations.
-    def _dedup_table_row(line: str) -> str:
-        if "|" not in line:
-            return line
-        cells = [c.strip() for c in line.split("|")]
-        seen: list[str] = []
-        for cell in cells:
-            if cell and cell not in seen:
-                seen.append(cell)
-        if not seen:
-            return ""
-        return "| " + " | ".join(seen) + " |"
-    markdown = "\n".join(_dedup_table_row(line) for line in markdown.splitlines())
-
-    # Convert <br> to newlines so the LLM sees labels and values on
-    # separate lines.
-    markdown = re.sub(r"<br\s*/?>", "\n", markdown, flags=re.IGNORECASE)
-
-    # Remove floorplan / sketch noise: lines made entirely of box-drawing
-    # characters (+, -, |, whitespace) and runs of empty table cells (||||).
-    markdown = re.sub(r"^[\s|+\-]+$", "", markdown, flags=re.MULTILINE)
-    markdown = re.sub(r"\|{3,}", "", markdown)
-
-    markdown = re.sub(r"\n{3,}", "\n\n", markdown)
-    return markdown
-
-
-# When the combined embedded-text + image-region OCR yields fewer chars than
-# this, trigger full-page OCR as a last resort. Property cards that bake all
-# field values into large rasterized images (rather than selectable PDF text)
-# otherwise end up with a mostly-empty context.
-_FULL_PAGE_OCR_FALLBACK_THRESHOLD = 1500
 
 
 def extract_pdf_text(state: AgentState) -> dict:
-    """Extract embedded text from the PDF and format it as markdown.
+    """OCR every page of the PDF via Tesseract and return the raw text.
 
-    Also OCRs any image-encoded text regions (Tesseract) and appends that
-    text to the markdown so labels/headings rendered as bitmaps aren't lost.
-    If the combined text is still thin, falls back to full-page OCR.
+    The text is fed verbatim to the extraction LLM — no markdown
+    conversion, no layout reconstruction, no table parsing. Tesseract's
+    raw output preserves the spatial relationships the LLM uses to pair
+    labels with values.
     """
     content = state["pdf_content"]
-
-    markdown = _extract_markdown(content)
-
-    # Append text recovered from image-encoded regions via Tesseract.
-    image_text = _ocr_image_regions(content)
-    if image_text:
-        markdown = f"{markdown}\n\n{image_text}" if markdown.strip() else image_text
-
-    if len(markdown) < _FULL_PAGE_OCR_FALLBACK_THRESHOLD:
-        page_text = _ocr_full_pages(content)
-        if page_text:
-            markdown = f"{markdown}\n\n{page_text}" if markdown.strip() else page_text
-
-    return {"pdf_markdown": markdown}
+    text = _ocr_pdf(content)
+    return {"pdf_text": text}
 
 
 def extract_pdf_and_photos(state: AgentState) -> dict:
-    """Run markdown extraction, Tesseract OCR, and photo classification in parallel.
+    """Run page-level OCR and photo classification in parallel.
 
-    Combines the results of extract_pdf_text and extract_property_photos but
-    executes the three independent I/O-bound tasks concurrently via threads.
+    Both operations open the PDF independently, so they don't contend for
+    PyMuPDF state. Each is otherwise I/O-bound (subprocess calls + Ollama
+    HTTP), so threading gets us real concurrency.
     """
     from concurrent.futures import ThreadPoolExecutor
 
     content = state["pdf_content"]
 
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        md_future = pool.submit(_extract_markdown, content)
-        ocr_future = pool.submit(_ocr_image_regions, content)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        text_future = pool.submit(_ocr_pdf, content)
         photos_future = pool.submit(extract_property_photos, state)
 
-    markdown = md_future.result()
-    image_text = ocr_future.result()
-    if image_text:
-        markdown = f"{markdown}\n\n{image_text}" if markdown.strip() else image_text
-
-    if len(markdown) < _FULL_PAGE_OCR_FALLBACK_THRESHOLD:
-        page_text = _ocr_full_pages(content)
-        if page_text:
-            markdown = f"{markdown}\n\n{page_text}" if markdown.strip() else page_text
-
+    text = text_future.result()
     photos_result = photos_future.result()
 
-    return {"pdf_markdown": markdown, **photos_result}
+    return {"pdf_text": text, **photos_result}
 
 
 def _is_property_photo(image_bytes: bytes) -> bool:
@@ -901,7 +734,7 @@ PROPERTY CARD TEXT:
 """
 
 
-def _retry_parcelid(data: dict, markdown: str) -> dict:
+def _retry_parcelid(data: dict, text: str) -> dict:
     """If the extracted parcelid is fewer than 3 characters, re-query the LLM
     once with a focused prompt to find a better one."""
     pid = data.get("parcelid")
@@ -915,7 +748,7 @@ def _retry_parcelid(data: dict, markdown: str) -> dict:
 
     full_text = _stream_llm(
         [{"role": "user", "content": PARCELID_RETRY_PROMPT.format(
-            parcelid=pid, document_text=markdown,
+            parcelid=pid, document_text=text,
         )}],
         label="parcelid-retry",
     )
@@ -1031,11 +864,11 @@ _HEATFUEL_TOKEN_MAP: list[tuple[str, str]] = [
 ]
 
 
-def _post_extract_heatfuel(data: dict, markdown: str) -> dict:
-    """Fill heatfuel from a 'Heat Fuel' / 'Fuel Type' label in the markdown.
+def _post_extract_heatfuel(data: dict, text: str) -> dict:
+    """Fill heatfuel from a 'Heat Fuel' / 'Fuel Type' label in the OCR text.
 
     The extraction LLM occasionally drops heatfuel even when the card clearly
-    labels it (e.g. "Heat Fuel ELECT"). This pass scans the markdown for the
+    labels it (e.g. "Heat Fuel ELECT"). This pass scans the text for the
     label and maps the adjacent token to a canonical fuel. Already-populated
     heatfuel values are never overwritten.
     """
@@ -1048,12 +881,12 @@ def _post_extract_heatfuel(data: dict, markdown: str) -> dict:
         r"(?:heat\s*fuel|fuel\s*type|fuel)\s*[:\-]?\s*([A-Za-z./\s-]{1,25})",
         re.IGNORECASE,
     )
-    for m in label_re.finditer(markdown):
+    for m in label_re.finditer(text):
         candidate = m.group(1).strip().upper()
         for pattern, canonical in _HEATFUEL_TOKEN_MAP:
             if re.search(rf"\b{pattern}\b", candidate):
                 logger.info(
-                    "heatfuel recovered from markdown: %r -> %s", m.group(0).strip(), canonical,
+                    "heatfuel recovered from text: %r -> %s", m.group(0).strip(), canonical,
                 )
                 data["heatfuel"] = canonical
                 return data
@@ -1258,8 +1091,8 @@ PROPERTY CARD TEXT:
 """
 
 
-def _retry_missing_labeled_fields(data: dict, markdown: str) -> dict:
-    """Re-query the LLM for any field whose label appears in the markdown
+def _retry_missing_labeled_fields(data: dict, text: str) -> dict:
+    """Re-query the LLM for any field whose label appears in the OCR text
     but was not filled in by the main extraction.
 
     Catches the common failure mode where individual fields get dropped
@@ -1274,7 +1107,7 @@ def _retry_missing_labeled_fields(data: dict, markdown: str) -> dict:
         existing = data.get(field)
         if existing not in (None, ""):
             continue
-        if label_re.search(markdown):
+        if label_re.search(text):
             missing.append((field, hint))
 
     if not missing:
@@ -1289,7 +1122,7 @@ def _retry_missing_labeled_fields(data: dict, markdown: str) -> dict:
     try:
         full_text = _stream_llm(
             [{"role": "user", "content": MISSING_FIELDS_RETRY_PROMPT.format(
-                field_block=field_block, document_text=markdown,
+                field_block=field_block, document_text=text,
             )}],
             label="missing-fields-retry",
         )
@@ -1361,19 +1194,19 @@ def _retry_missing_labeled_fields(data: dict, markdown: str) -> dict:
 
 
 def extract_data(state: AgentState) -> dict:
-    """Extract structured property data from the markdown PDF text."""
-    markdown = state.get("pdf_markdown", "") or ""
-    if len(markdown.strip()) < 50:
+    """Extract structured property data from the OCR'd PDF text."""
+    text = state.get("pdf_text", "") or ""
+    if len(text.strip()) < 50:
         logger.info(
             "PDF yielded %d chars of text — skipping extraction",
-            len(markdown.strip()),
+            len(text.strip()),
         )
         return {"property_data": {}}
 
-    data = _run_extraction_llm(markdown, state.get("context"))
+    data = _run_extraction_llm(text, state.get("context"))
     data = _reconcile_value_totals(data)
-    data = _retry_parcelid(data, markdown)
-    data = _post_extract_heatfuel(data, markdown)
-    data = _retry_missing_labeled_fields(data, markdown)
+    data = _retry_parcelid(data, text)
+    data = _post_extract_heatfuel(data, text)
+    data = _retry_missing_labeled_fields(data, text)
     logger.info("Extracted %d fields from PDF text", len(data))
     return {"property_data": data}

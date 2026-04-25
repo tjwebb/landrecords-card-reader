@@ -133,7 +133,7 @@ FIXTURES: dict[str, dict[str, Any]] = {
         "yearbuilt": ("int", 2000),
         "bldgsqft": ("int", 1539),
         "landvalue": ("int", 27000),
-        "imprvalue": ("int", 65000),
+        "imprvalue": ("int", 67700),
         "totalvalue": ("int", 94700),
         "taxacres": ("float", 13.477),
         "heatfuel": ("any_of", ["ELECTRIC"]),
@@ -145,10 +145,7 @@ FIXTURES: dict[str, dict[str, Any]] = {
         "parceladdr": ("substr", "ELF"),
         "yearbuilt": ("int", 1985),
         "landvalue": ("int", 14400),
-        # Card shows "Building Value 240,300" + extras/outbuildings = 288,000
-        # "Total Building Value". LLM consistently picks the standalone
-        # building value; total is reflected via totalvalue = 302,400.
-        "imprvalue": ("int", 240300),
+        "imprvalue": ("int", 288000),
         "totalvalue": ("int", 302400),
         "extwall": ("substr", "BRICK"),
         "roofcover": ("substr", "SHINGLES"),
@@ -354,7 +351,7 @@ def pipeline_result(request) -> dict:
         "pdf_url": f"file://{pdf_path}",
         "pdf_bytes": pdf_bytes,
         "pdf_content": b"",
-        "pdf_markdown": "",
+        "pdf_text": "",
         "property_photos": [],
         "property_data": {},
         "result": "",
@@ -432,10 +429,10 @@ class TestPipeline:
     def test_pdf_content_populated(self, pipeline_result):
         assert len(pipeline_result["pdf_content"]) > 0
 
-    def test_markdown_has_text(self, pipeline_result):
-        assert len(pipeline_result["pdf_markdown"]) > 50, (
+    def test_text_has_content(self, pipeline_result):
+        assert len(pipeline_result["pdf_text"]) > 50, (
             f"{pipeline_result['_pdf_name']}: text extraction produced <50 chars "
-            f"(len={len(pipeline_result['pdf_markdown'])})"
+            f"(len={len(pipeline_result['pdf_text'])})"
         )
 
     def test_expected_fields(self, pipeline_result):

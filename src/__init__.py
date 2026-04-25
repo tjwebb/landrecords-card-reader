@@ -55,7 +55,7 @@ def read_property_card(
         "pdf_url": pdf_url,
         "pdf_bytes": pdf_bytes,
         "pdf_content": b"",
-        "pdf_markdown": "",
+        "pdf_text": "",
         "property_photos": [],
         "property_data": {},
         "result": "",

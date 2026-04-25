@@ -29,7 +29,7 @@ def main():
         "pdf_url": args.url,
         "pdf_bytes": None,
         "pdf_content": b"",
-        "pdf_markdown": "",
+        "pdf_text": "",
         "property_photos": [],
         "property_data": {},
         "result": "",

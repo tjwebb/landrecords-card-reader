@@ -27,7 +27,7 @@ def initial_state():
         "pdf_url": EXAMPLE_URL,
         "pdf_bytes": None,
         "pdf_content": b"",
-        "pdf_markdown": "",
+        "pdf_text": "",
         "property_photos": [],
         "property_data": {},
         "result": "",
@@ -64,14 +64,14 @@ class TestDownloadPdf:
 
 
 class TestExtractPdfText:
-    def test_returns_non_empty_markdown(self, text_state):
-        assert len(text_state["pdf_markdown"]) > 100, (
-            f"PDF text extraction should return substantial markdown, "
-            f"got {len(text_state['pdf_markdown'])} chars"
+    def test_returns_non_empty_text(self, text_state):
+        assert len(text_state["pdf_text"]) > 100, (
+            f"PDF text extraction should return substantial text, "
+            f"got {len(text_state['pdf_text'])} chars"
         )
 
     def test_contains_expected_keywords(self, text_state):
-        text = text_state["pdf_markdown"].lower()
+        text = text_state["pdf_text"].lower()
         keywords = ["parcel", "owner", "acre", "value", "land", "year", "tax"]
         found = [kw for kw in keywords if kw in text]
         assert len(found) >= 3, (

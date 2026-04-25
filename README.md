@@ -107,14 +107,19 @@ The extraction prompt maps over 80 property card fields including:
 
 1. **Download** the PDF (or accept pre-downloaded bytes)
 2. **In parallel**:
-   - **Extract embedded text** via pymupdf4llm (markdown)
-   - **OCR image regions** via Tesseract for text baked into raster images
+   - **OCR every page** via Tesseract — each page is rendered at 300 DPI
+     (configurable via `CARD_READER_OCR_DPI`) and OCR'd as a single bitmap;
+     pages run in parallel via a thread pool
    - **Extract & classify property photos** — candidate images are filtered
      by size/aspect ratio, then sent to a vision model to keep only actual
      photographs (discarding sketches, floorplans, maps, etc.)
-3. **Extract structured data** by sending the markdown to an Ollama LLM
+3. **Extract structured data** by sending the raw OCR text to an Ollama LLM
 4. **Reconcile values** — verifies `landvalue + imprvalue == totalvalue` and
-   retries if inconsistent
+   computes any single missing value arithmetically
+5. **Targeted retries** — if `parcelid` is too short, re-asks; if a heat-fuel
+   label is present but `heatfuel` is empty, runs a deterministic regex
+   fallback then a focused LLM retry; if any registered field's label is in
+   the OCR text but the value is empty, batches them into one LLM retry
 
 ## License
 
