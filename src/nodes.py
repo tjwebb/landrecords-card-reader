@@ -502,6 +502,48 @@ def _ocr_image_regions(content: bytes) -> str:
     return combined
 
 
+def _ocr_full_pages(content: bytes, dpi: int = 300) -> str:
+    """OCR each page by rendering it as a full-page bitmap.
+
+    Falls back when embedded text + image-region OCR miss content — for
+    example, property cards that bake every value (owner, year built, heat
+    fuel, etc.) into a single large rasterized card image, or PDFs whose
+    values are scattered across hundreds of tiny inline images too small for
+    the per-region OCR path to pick up.
+    """
+    import io
+    try:
+        import pymupdf as fitz
+        import pytesseract
+        from PIL import Image
+    except ModuleNotFoundError:
+        logger.debug("pytesseract/Pillow not installed; skipping full-page OCR")
+        return ""
+
+    doc = fitz.open(stream=content, filetype="pdf")
+    sections: list[str] = []
+    try:
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            try:
+                pix = page.get_pixmap(dpi=dpi)
+                img = Image.open(io.BytesIO(pix.tobytes("png")))
+                text = pytesseract.image_to_string(img).strip()
+            except Exception as e:
+                logger.debug("Full-page OCR failed on page %d: %s", page_num + 1, e)
+                continue
+            if text:
+                sections.append(f"## Page {page_num + 1} — Full-Page OCR\n\n{text}")
+    finally:
+        doc.close()
+
+    combined = "\n\n".join(sections)
+    if combined:
+        logger.info("Full-page OCR: %d chars across %d page(s)",
+                    len(combined), len(sections))
+    return combined
+
+
 def _extract_markdown(content: bytes) -> str:
     """Extract embedded text from the PDF and clean it up as markdown."""
     import pymupdf as fitz
@@ -548,11 +590,19 @@ def _extract_markdown(content: bytes) -> str:
     return markdown
 
 
+# When the combined embedded-text + image-region OCR yields fewer chars than
+# this, trigger full-page OCR as a last resort. Property cards that bake all
+# field values into large rasterized images (rather than selectable PDF text)
+# otherwise end up with a mostly-empty context.
+_FULL_PAGE_OCR_FALLBACK_THRESHOLD = 1500
+
+
 def extract_pdf_text(state: AgentState) -> dict:
     """Extract embedded text from the PDF and format it as markdown.
 
     Also OCRs any image-encoded text regions (Tesseract) and appends that
     text to the markdown so labels/headings rendered as bitmaps aren't lost.
+    If the combined text is still thin, falls back to full-page OCR.
     """
     content = state["pdf_content"]
 
@@ -562,6 +612,11 @@ def extract_pdf_text(state: AgentState) -> dict:
     image_text = _ocr_image_regions(content)
     if image_text:
         markdown = f"{markdown}\n\n{image_text}" if markdown.strip() else image_text
+
+    if len(markdown) < _FULL_PAGE_OCR_FALLBACK_THRESHOLD:
+        page_text = _ocr_full_pages(content)
+        if page_text:
+            markdown = f"{markdown}\n\n{page_text}" if markdown.strip() else page_text
 
     return {"pdf_markdown": markdown}
 
@@ -585,6 +640,11 @@ def extract_pdf_and_photos(state: AgentState) -> dict:
     image_text = ocr_future.result()
     if image_text:
         markdown = f"{markdown}\n\n{image_text}" if markdown.strip() else image_text
+
+    if len(markdown) < _FULL_PAGE_OCR_FALLBACK_THRESHOLD:
+        page_text = _ocr_full_pages(content)
+        if page_text:
+            markdown = f"{markdown}\n\n{page_text}" if markdown.strip() else page_text
 
     photos_result = photos_future.result()
 
@@ -921,6 +981,49 @@ def fill_from_photo(data: dict, image_bytes: bytes) -> dict:
     return data
 
 
+# Fuel-abbreviation -> canonical heatfuel value. Anchored so "ELECT" matches
+# but "ELECTRONICS" does not. Order matters only for readability.
+_HEATFUEL_TOKEN_MAP: list[tuple[str, str]] = [
+    (r"ELEC(?:T(?:R(?:IC)?)?)?", "ELECTRIC"),
+    (r"PROPANE|LP\s*GAS|LPG", "PROPANE"),
+    (r"NATURAL\s*GAS|N\.?G\.?|GAS", "GAS"),
+    (r"FUEL\s*OIL|OIL", "OIL"),
+    (r"WOOD(?:\s*STOVE|BURN(?:ING)?)?", "WOOD"),
+    (r"SOLAR", "SOLAR"),
+    (r"COAL", "COAL"),
+    (r"NONE", "NONE"),
+]
+
+
+def _post_extract_heatfuel(data: dict, markdown: str) -> dict:
+    """Fill heatfuel from a 'Heat Fuel' / 'Fuel Type' label in the markdown.
+
+    The extraction LLM occasionally drops heatfuel even when the card clearly
+    labels it (e.g. "Heat Fuel ELECT"). This pass scans the markdown for the
+    label and maps the adjacent token to a canonical fuel. Already-populated
+    heatfuel values are never overwritten.
+    """
+    if data.get("heatfuel"):
+        return data
+
+    # Look for "Heat Fuel" / "Fuel Type" / "Fuel:" followed by a value within
+    # the next ~30 chars (same line or next line on the card).
+    label_re = re.compile(
+        r"(?:heat\s*fuel|fuel\s*type|fuel)\s*[:\-]?\s*([A-Za-z./\s-]{1,25})",
+        re.IGNORECASE,
+    )
+    for m in label_re.finditer(markdown):
+        candidate = m.group(1).strip().upper()
+        for pattern, canonical in _HEATFUEL_TOKEN_MAP:
+            if re.search(rf"\b{pattern}\b", candidate):
+                logger.info(
+                    "heatfuel recovered from markdown: %r -> %s", m.group(0).strip(), canonical,
+                )
+                data["heatfuel"] = canonical
+                return data
+    return data
+
+
 def extract_data(state: AgentState) -> dict:
     """Extract structured property data from the markdown PDF text."""
     markdown = state.get("pdf_markdown", "") or ""
@@ -934,5 +1037,6 @@ def extract_data(state: AgentState) -> dict:
     data = _run_extraction_llm(markdown, state.get("context"))
     data = _reconcile_value_totals(data)
     data = _retry_parcelid(data, markdown)
+    data = _post_extract_heatfuel(data, markdown)
     logger.info("Extracted %d fields from PDF text", len(data))
     return {"property_data": data}
