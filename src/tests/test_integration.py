@@ -13,9 +13,10 @@ import logging
 
 import pytest
 
-from .nodes import download_pdf, extract_data, extract_pdf_text
+from ..nodes import download_pdf, extract_data, extract_pdf_text
 
-EXAMPLE_URL = "https://henrycova.interactivegis.com/resources/landcards_2026/009940000.pdf"
+EXAMPLE_URL = "https://henrycova.interactivegis.com/resources/landcards_2026/075740001.pdf"
+
 
 logger = logging.getLogger(__name__)
 

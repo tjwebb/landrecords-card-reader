@@ -472,8 +472,16 @@ def _ocr_image_regions(content: bytes) -> str:
     than embedded text — pymupdf4llm cannot read those. This runs Tesseract on
     each text-bearing image region and returns one markdown section per page
     containing the joined OCR output.
+
+    Regions are OCR'd in parallel via a thread pool: pytesseract shells out
+    to the ``tesseract`` binary per call, so each invocation is its own OS
+    process and threads exist only to wait on subprocess output. Cards
+    routinely contain 25-100+ small text regions; serial OCR was the bulk
+    of pipeline latency.
     """
     import io
+    import os
+    from concurrent.futures import ThreadPoolExecutor
     try:
         import pytesseract
         from PIL import Image
@@ -481,15 +489,42 @@ def _ocr_image_regions(content: bytes) -> str:
         logger.debug("pytesseract/Pillow not installed; skipping OCR")
         return ""
 
-    by_page: dict[int, list[str]] = {}
-    for page_num, _idx, _ext, img_bytes in _iter_text_image_regions(content):
+    regions = list(_iter_text_image_regions(content))
+    if not regions:
+        return ""
+
+    def _ocr_one(region: tuple) -> tuple:
+        page_num, idx, _ext, img_bytes = region
         try:
             img = Image.open(io.BytesIO(img_bytes))
             text = pytesseract.image_to_string(img).strip()
-            if text:
-                by_page.setdefault(page_num, []).append(text)
+            return page_num, idx, img.width, img.height, text, None
         except Exception as e:
-            logger.debug("OCR failed on page %d image: %s", page_num, e)
+            return page_num, idx, 0, 0, "", e
+
+    # Cap workers at cpu_count — each task spawns a tesseract subprocess so
+    # over-subscription just thrashes. Fall back to 4 if cpu_count is unknown.
+    max_workers = min(len(regions), os.cpu_count() or 4)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        # ``map`` preserves input order, which keeps OCR text on each page in
+        # the same top-to-bottom order yielded by _iter_text_image_regions.
+        results = list(pool.map(_ocr_one, regions))
+
+    by_page: dict[int, list[str]] = {}
+    region_count = 0
+    for page_num, idx, w, h, text, err in results:
+        if err is not None:
+            logger.debug("OCR failed on page %d image %d: %s", page_num, idx, err)
+            continue
+        if text:
+            region_count += 1
+            logger.info(
+                "OCR region p%d#%d (%dx%d) -> %r",
+                page_num, idx, w, h,
+                text if len(text) <= 200 else text[:200] + "…",
+            )
+            by_page.setdefault(page_num, []).append(text)
 
     sections = [
         f"## Page {page_num} — Image-Encoded Text\n\n" + "\n".join(texts)
@@ -497,8 +532,12 @@ def _ocr_image_regions(content: bytes) -> str:
     ]
     combined = "\n\n".join(sections)
     if combined:
-        logger.info("OCR'd image regions: %d chars across %d page section(s)",
-                    len(combined), len(sections))
+        logger.info(
+            "OCR'd image regions: %d region(s) across %d worker(s), "
+            "%d chars across %d page section(s)",
+            region_count, max_workers, len(combined), len(sections),
+        )
+        logger.info("OCR image-region full text:\n%s", combined)
     return combined
 
 
@@ -533,6 +572,10 @@ def _ocr_full_pages(content: bytes, dpi: int = 300) -> str:
                 logger.debug("Full-page OCR failed on page %d: %s", page_num + 1, e)
                 continue
             if text:
+                logger.info(
+                    "Full-page OCR p%d (%dx%d @ %d DPI) -> %d chars:\n%s",
+                    page_num + 1, img.width, img.height, dpi, len(text), text,
+                )
                 sections.append(f"## Page {page_num + 1} — Full-Page OCR\n\n{text}")
     finally:
         doc.close()
@@ -1024,6 +1067,306 @@ def _post_extract_heatfuel(data: dict, markdown: str) -> dict:
     return data
 
 
+# Per-field label regex + short retry hint. When a label appears in the
+# markdown but the field is empty after the main extraction (and any
+# deterministic post-processors), the retry below re-asks the LLM in one
+# focused batch. Each pattern is anchored at word boundaries to keep label
+# detection conservative — false positives just trigger an extra LLM call,
+# but false negatives leave fields unfilled.
+_FIELD_RETRY_HINTS: dict[str, tuple[re.Pattern, str]] = {
+    "heatfuel": (
+        re.compile(
+            r"\b(?:heat\s*fuel|heating\s*fuel|fuel\s*type|fuel\s*source|"
+            r"heating\s*source|energy\s*source|heat\s*type|heating\s*system)\b",
+            re.IGNORECASE,
+        ),
+        "Allowed values: GAS, OIL, ELECTRIC, PROPANE, WOOD, SOLAR, COAL, NONE. "
+        "Common abbreviations: 'ELECT'/'ELEC' -> ELECTRIC, 'LP'/'LPG' -> PROPANE, "
+        "'N.G.'/'Natural Gas' -> GAS, 'Fuel Oil' -> OIL.",
+    ),
+    "heating": (
+        re.compile(r"\b(?:heating(?:\s*system|\s*type)?|heat\s*type|hvac\s*system)\b", re.IGNORECASE),
+        "Heating system delivery type (FORCED AIR, HEAT PUMP, BASEBOARD, RADIANT, "
+        "WARMED & COOLED AIR). NOT the fuel.",
+    ),
+    "cooling": (
+        re.compile(r"\b(?:cooling|central\s*air|a\s*/?\s*c\s*type|air\s*condition)\b", re.IGNORECASE),
+        "Cooling system type (CENTRAL AIR, NONE, WINDOW UNIT, HEAT PUMP, etc.).",
+    ),
+    "yearbuilt": (
+        re.compile(
+            r"\b(?:year\s*built|yr\s*blt|original\s*year|year\s*of\s*construction)\b",
+            re.IGNORECASE,
+        ),
+        "Original year built (4-digit integer). NOT effective year, effective age, "
+        "or remodel year.",
+    ),
+    "yearremodel": (
+        re.compile(r"\b(?:year\s*remodel(?:ed)?|yr\s*rmd|remodel\s*year)\b", re.IGNORECASE),
+        "Year of last remodel (4-digit integer).",
+    ),
+    "bldgsqft": (
+        re.compile(
+            r"\b(?:living\s*area|heated\s*s(?:f|q\.?\s*ft)|finished\s*area|"
+            r"total\s*living(?:\s*area)?|main\s*area|total\s*square\s*foot)\b",
+            re.IGNORECASE,
+        ),
+        "Living / heated / finished area square footage (integer). NOT gross "
+        "building area.",
+    ),
+    "bedrooms": (
+        re.compile(
+            r"\b(?:total\s*bedrooms?|number\s*of\s*bedrooms?|#\s*bedrooms?|bedrooms?)\b",
+            re.IGNORECASE,
+        ),
+        "Bedroom count (integer).",
+    ),
+    "fullbaths": (
+        re.compile(
+            r"\b(?:full\s*baths?|total\s*bathrooms?|number\s*of\s*baths?)\b",
+            re.IGNORECASE,
+        ),
+        "Full bathroom count (integer).",
+    ),
+    "halfbaths": (
+        re.compile(r"\b(?:half\s*baths?|1\s*/\s*2\s*baths?|powder\s*rooms?)\b", re.IGNORECASE),
+        "Half bathroom count (integer).",
+    ),
+    "fireplaces": (
+        re.compile(
+            r"\b(?:#\s*of\s*fireplaces?|number\s*of\s*fireplaces?|fireplaces?)\b",
+            re.IGNORECASE,
+        ),
+        "Fireplace count (integer).",
+    ),
+    "imprvalue": (
+        re.compile(
+            r"\b(?:improvement\s*value|building\s*value|impr\s*value)\b",
+            re.IGNORECASE,
+        ),
+        "Improvement / building value (integer, no commas / $).",
+    ),
+    "landvalue": (
+        re.compile(r"\bland\s*value\b", re.IGNORECASE),
+        "Land value (integer, no commas / $).",
+    ),
+    "totalvalue": (
+        re.compile(r"\b(?:total\s*value|total\s*assessed|grand\s*total)\b", re.IGNORECASE),
+        "Total assessed value (integer, no commas / $).",
+    ),
+    "saleamt": (
+        re.compile(r"\bsale\s*(?:price|amount|amt)\b", re.IGNORECASE),
+        "Most recent sale price (integer). Use the latest transfer only.",
+    ),
+    "saledate": (
+        re.compile(r"\bsale\s*date\b", re.IGNORECASE),
+        "Most recent sale date in YYYY-MM-DD format. Use the latest transfer only.",
+    ),
+    "ownername": (
+        re.compile(r"\b(?:current\s*owner|owner\s*name|primary\s*owner)\b", re.IGNORECASE),
+        "Current owner name (text).",
+    ),
+    "parceladdr": (
+        re.compile(
+            r"\b(?:property\s*(?:address|location)|situs(?:\s*address)?|"
+            r"site\s*address|location\s*address)\b",
+            re.IGNORECASE,
+        ),
+        "Physical property address (text). NOT the owner's mailing address.",
+    ),
+    "legaldesc": (
+        re.compile(r"\b(?:legal\s*description|legal\s*desc)\b", re.IGNORECASE),
+        "Legal description (text).",
+    ),
+    "foundation": (
+        re.compile(r"\bfoundation(?:\s*wall)?\b", re.IGNORECASE),
+        "Foundation type (text).",
+    ),
+    "extwall": (
+        re.compile(r"\bext(?:erior)?\s*wall\b", re.IGNORECASE),
+        "Exterior wall material (text). NOT an interior wall material.",
+    ),
+    "intwall": (
+        re.compile(r"\bint(?:erior)?\s*wall\b", re.IGNORECASE),
+        "Interior wall material (text). NOT an exterior wall material.",
+    ),
+    "roofcover": (
+        re.compile(r"\broof\s*cover\b", re.IGNORECASE),
+        "Roof cover material (text).",
+    ),
+    "roofstyle": (
+        re.compile(r"\broof\s*(?:style|type|shape)\b", re.IGNORECASE),
+        "Roof style (text, e.g. GABLE, HIP, FLAT).",
+    ),
+    "bldgquality": (
+        re.compile(r"\b(?:grade(?:\s*\%)?|building\s*grade|building\s*quality)\b", re.IGNORECASE),
+        "Building grade / quality (text, often a letter or letter+number).",
+    ),
+    "numfloors": (
+        re.compile(
+            r"\b(?:stories|number\s*of\s*floors|num\s*floors|floor\s*count)\b",
+            re.IGNORECASE,
+        ),
+        "Number of floors / stories (integer; round 1.5 -> 1, 2.5 -> 2).",
+    ),
+    "usecode": (
+        re.compile(r"\b(?:property\s*use|use\s*code|land\s*use\s*code)\b", re.IGNORECASE),
+        "Use code (short alphanumeric, e.g. 'R1', '00', '200R').",
+    ),
+    "zoningcode": (
+        re.compile(r"\bzoning(?:\s*code)?\b", re.IGNORECASE),
+        "Zoning code (short alphanumeric, e.g. 'SR', 'R-1', 'A1').",
+    ),
+}
+
+
+# Canonical heatfuel set used to normalize the LLM's retry response.
+_CANONICAL_HEATFUEL = {"GAS", "OIL", "ELECTRIC", "PROPANE", "WOOD", "SOLAR", "COAL", "NONE"}
+
+
+def _normalize_heatfuel(value: str) -> str | None:
+    """Map a free-form heatfuel string to its canonical value if possible."""
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip().upper()
+    if not candidate:
+        return None
+    if candidate in _CANONICAL_HEATFUEL:
+        return candidate
+    for pattern, mapped in _HEATFUEL_TOKEN_MAP:
+        if re.fullmatch(pattern, candidate):
+            return mapped
+    return None
+
+
+MISSING_FIELDS_RETRY_PROMPT = """\
+The property card text below carries labels for fields that were NOT filled
+in on the first extraction pass. Re-read the card and fill in any of the
+fields below that you can confidently determine.
+
+Missing fields with hints:
+{field_block}
+
+CRITICAL rules — read carefully:
+- A label being PRESENT does NOT mean the field has a value. If the label's
+  value cell is blank, empty, dashed, or whitespace, OMIT that field. Do
+  NOT guess and do NOT borrow a value from a nearby cell.
+- Each field must come from its OWN labeled cell on the card. Never reuse
+  a value from one field as the value for another (e.g. a "Primary Use"
+  code is never a "Zoning Code", a "Year Remodeled" is never the
+  "Year Built").
+- Return ONLY a JSON object containing only the fields you can confidently
+  fill in. Numeric fields must be numbers (no $, no commas). Dates must be
+  YYYY-MM-DD.
+- If you cannot confidently determine ANY of these fields, return {{}}.
+
+PROPERTY CARD TEXT:
+{document_text}
+"""
+
+
+def _retry_missing_labeled_fields(data: dict, markdown: str) -> dict:
+    """Re-query the LLM for any field whose label appears in the markdown
+    but was not filled in by the main extraction.
+
+    Catches the common failure mode where individual fields get dropped
+    under context noise — a busy OCR'd construction-detail block buries
+    individual values, but the labels are right there. By naming the
+    missing fields explicitly we focus the model's attention.
+
+    Already-populated values are never overwritten.
+    """
+    missing: list[tuple[str, str]] = []
+    for field, (label_re, hint) in _FIELD_RETRY_HINTS.items():
+        existing = data.get(field)
+        if existing not in (None, ""):
+            continue
+        if label_re.search(markdown):
+            missing.append((field, hint))
+
+    if not missing:
+        return data
+
+    field_block = "\n".join(f"  {f}: {h}" for f, h in missing)
+    logger.warning(
+        "Missing-field retry: %d labeled field(s) unfilled: %s",
+        len(missing), ", ".join(f for f, _ in missing),
+    )
+
+    try:
+        full_text = _stream_llm(
+            [{"role": "user", "content": MISSING_FIELDS_RETRY_PROMPT.format(
+                field_block=field_block, document_text=markdown,
+            )}],
+            label="missing-fields-retry",
+        )
+    except Exception as e:
+        logger.warning("Missing-field retry failed (%s); leaving fields unset", e)
+        return data
+
+    try:
+        raw = _parse_json_response(full_text)
+    except json.JSONDecodeError:
+        logger.warning("Missing-field retry returned non-JSON; leaving fields unset")
+        return data
+
+    if not isinstance(raw, dict):
+        return data
+
+    requested = {f for f, _ in missing}
+    restricted = {k: v for k, v in raw.items() if k in requested}
+
+    # Heatfuel needs canonical normalization since the LLM may emit "ELECT".
+    if "heatfuel" in restricted:
+        normalized = _normalize_heatfuel(str(restricted["heatfuel"]))
+        if normalized is None:
+            logger.warning(
+                "heatfuel retry returned non-canonical %r; dropping", restricted["heatfuel"],
+            )
+            del restricted["heatfuel"]
+        else:
+            restricted["heatfuel"] = normalized
+
+    coerced = _coerce_types(restricted)
+
+    # Reject retry values that collide with an already-extracted value for a
+    # different field. This is the LLM's main misallocation failure mode:
+    # when it can't find the labeled value, it falls back to a nearby cell
+    # (e.g. emitting Primary Use as zoningcode). Comparing as upper-case
+    # strings catches both numeric-as-string and case-folded matches.
+    existing_values = {
+        str(v).strip().upper()
+        for k, v in data.items()
+        if k not in coerced and v not in (None, "")
+    }
+
+    added: list[str] = []
+    rejected: list[str] = []
+    for k, v in coerced.items():
+        if data.get(k) not in (None, ""):
+            continue
+        if str(v).strip().upper() in existing_values:
+            rejected.append(f"{k}={v!r} (collides with another field)")
+            continue
+        data[k] = v
+        added.append(k)
+
+    if added:
+        logger.info(
+            "Missing-field retry recovered %d field(s): %s",
+            len(added), ", ".join(f"{k}={data[k]!r}" for k in added),
+        )
+    if rejected:
+        logger.warning(
+            "Missing-field retry rejected %d field(s): %s",
+            len(rejected), "; ".join(rejected),
+        )
+    if not added and not rejected:
+        logger.info("Missing-field retry yielded no usable fields")
+
+    return data
+
+
 def extract_data(state: AgentState) -> dict:
     """Extract structured property data from the markdown PDF text."""
     markdown = state.get("pdf_markdown", "") or ""
@@ -1038,5 +1381,6 @@ def extract_data(state: AgentState) -> dict:
     data = _reconcile_value_totals(data)
     data = _retry_parcelid(data, markdown)
     data = _post_extract_heatfuel(data, markdown)
+    data = _retry_missing_labeled_fields(data, markdown)
     logger.info("Extracted %d fields from PDF text", len(data))
     return {"property_data": data}
