@@ -17,11 +17,9 @@ except ImportError:
     pass
 
 from .config import (
-    CLASSIFICATION_CONTEXT_LENGTH,
-    EXTRACTION_CONTEXT_LENGTH,
-    EXTRACTION_MODEL,
-    OLLAMA_BASE_URL,
-    PHOTO_CLASSIFICATION_MODEL,
+    CARD_READER_EXTRACTION_MODEL,
+    CARD_READER_OLLAMA_HOST,
+    CARD_READER_PHOTO_CLASSIFICATION_MODEL,
 )
 from .state import AgentState
 
@@ -229,13 +227,11 @@ def _stream_llm(messages: list[dict], *, label: str = "extraction") -> str:
     stream_to_console = logger.isEnabledFor(logging.DEBUG)
 
     payload = {
-        "model": EXTRACTION_MODEL,
+        "model": CARD_READER_EXTRACTION_MODEL,
         "messages": messages,
         "stream": True,
         "think": False,
     }
-    if EXTRACTION_CONTEXT_LENGTH:
-        payload.setdefault("options", {})["num_ctx"] = EXTRACTION_CONTEXT_LENGTH
 
     if stream_to_console:
         sys.stderr.write(f"ollama ({label})> ")
@@ -244,7 +240,7 @@ def _stream_llm(messages: list[dict], *, label: str = "extraction") -> str:
     chunks: list[str] = []
     metadata: dict = {}
 
-    with httpx.Client(base_url=OLLAMA_BASE_URL, timeout=300) as client:
+    with httpx.Client(base_url=CARD_READER_OLLAMA_HOST, timeout=300) as client:
         with client.stream("POST", "/api/chat", json=payload) as resp:
             resp.raise_for_status()
             for line in resp.iter_lines():
@@ -697,7 +693,7 @@ def extract_pdf_and_photos(state: AgentState) -> dict:
 def _is_property_photo(image_bytes: bytes) -> bool:
     """Ask the vision model whether an image is a photo of a property.
 
-    Uses PHOTO_CLASSIFICATION_MODEL (a lightweight vision model) via Ollama
+    Uses CARD_READER_PHOTO_CLASSIFICATION_MODEL (a lightweight vision model) via Ollama
     with an image token budget of 70 to keep classification fast.
 
     Returns True for photographs of buildings, houses, structures, or land/lots.
@@ -707,7 +703,7 @@ def _is_property_photo(image_bytes: bytes) -> bool:
 
     b64 = base64.b64encode(image_bytes).decode()
     payload = {
-        "model": PHOTO_CLASSIFICATION_MODEL,
+        "model": CARD_READER_PHOTO_CLASSIFICATION_MODEL,
         "messages": [{
             "role": "user",
             "content": (
@@ -722,18 +718,17 @@ def _is_property_photo(image_bytes: bytes) -> bool:
         "think": False,
         "options": {
             "visual_token_budget": 70,
-            **({"num_ctx": CLASSIFICATION_CONTEXT_LENGTH} if CLASSIFICATION_CONTEXT_LENGTH else {}),
         },
     }
 
     try:
-        with httpx.Client(base_url=OLLAMA_BASE_URL, timeout=60) as client:
+        with httpx.Client(base_url=CARD_READER_OLLAMA_HOST, timeout=60) as client:
             resp = client.post("/api/chat", json=payload)
             resp.raise_for_status()
             answer = resp.json().get("message", {}).get("content", "").strip().upper()
             is_photo = answer.startswith("YES")
             logger.info("Photo classification (%s): %r -> %s",
-                       PHOTO_CLASSIFICATION_MODEL, answer, is_photo)
+                       CARD_READER_PHOTO_CLASSIFICATION_MODEL, answer, is_photo)
             return is_photo
     except Exception as e:
         logger.warning("Photo classification failed (%s); assuming not a property photo", e)
@@ -822,7 +817,7 @@ def _run_extraction_llm(source_text: str, context: str | None = None) -> dict:
     prompt = EXTRACTION_PROMPT.format(document_text=source_text)
     if context and context.strip():
         prompt = f"{prompt}\n\nAdditional instructions:\n{context.strip()}"
-    logger.info("Extracting structured data (model=%s)", EXTRACTION_MODEL)
+    logger.info("Extracting structured data (model=%s)", CARD_READER_EXTRACTION_MODEL)
 
     messages = [
         {"role": "system", "content": "You are a precise data extraction assistant. Return only valid JSON."},
@@ -987,15 +982,13 @@ def fill_from_photo(data: dict, image_bytes: bytes) -> dict:
     try:
         # Use Ollama directly to set visual_token_budget for gemma4 models.
         payload = {
-            "model": EXTRACTION_MODEL,
+            "model": CARD_READER_EXTRACTION_MODEL,
             "messages": [{"role": "user", "content": prompt, "images": [b64]}],
             "stream": False,
             "think": False,
             "options": {"visual_token_budget": 1120},
         }
-        if EXTRACTION_CONTEXT_LENGTH:
-            payload["options"]["num_ctx"] = EXTRACTION_CONTEXT_LENGTH
-        with httpx.Client(base_url=OLLAMA_BASE_URL, timeout=300) as client:
+        with httpx.Client(base_url=CARD_READER_OLLAMA_HOST, timeout=300) as client:
             resp = client.post("/api/chat", json=payload)
             resp.raise_for_status()
             result = resp.json()

@@ -1,7 +1,7 @@
 """Integration test against the Henry County (NC) hcama property card.
 
 Requires:
-- Ollama running at OLLAMA_BASE_URL with the configured extraction model
+- Ollama running at CARD_READER_OLLAMA_HOST with the configured extraction model
 - Network access to download the example PDF
 
 Run:

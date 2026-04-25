@@ -85,11 +85,9 @@ Set via environment variables or a `.env` file:
 
 | Variable | Default | Description |
 |---|---|---|
-| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server URL |
-| `EXTRACTION_MODEL` | `gemma4:26b-a4b-it-q8_0` | Model for structured extraction |
-| `PHOTO_CLASSIFICATION_MODEL` | `gemma4:e2b` | Lightweight vision model for photo classification |
-| `EXTRACTION_CONTEXT_LENGTH` | (model default) | Override Ollama context window for extraction |
-| `CLASSIFICATION_CONTEXT_LENGTH` | (model default) | Override Ollama context window for photo classification |
+| `CARD_READER_OLLAMA_HOST` | `http://localhost:11434` | Ollama server URL |
+| `CARD_READER_EXTRACTION_MODEL` | `gemma4:26b-a4b-it-q8_0` | Model for structured extraction |
+| `CARD_READER_PHOTO_CLASSIFICATION_MODEL` | `gemma4:e2b` | Lightweight vision model for photo classification |
 
 
 ## Extracted fields

@@ -3,7 +3,7 @@
 Requires:
 - Network access to fetch the HTML property card
 - wkhtmltopdf installed (system dependency for pdfkit)
-- Ollama running with the configured EXTRACTION_MODEL
+- Ollama running with the configured CARD_READER_EXTRACTION_MODEL
 
 Run:
     pytest src/tests/test_spotsylvania.py -v -s
@@ -17,7 +17,7 @@ import logging
 import httpx
 import pytest
 
-from ..config import OLLAMA_BASE_URL
+from ..config import CARD_READER_OLLAMA_HOST
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +28,7 @@ PV_URL = "https://apps.spotsylvaniacountyva.gov/assessment/assessment/Info.cfm?O
 def _ollama_reachable() -> bool:
     try:
         with httpx.Client(timeout=3.0) as client:
-            r = client.get(f"{OLLAMA_BASE_URL}/api/tags")
+            r = client.get(f"{CARD_READER_OLLAMA_HOST}/api/tags")
             return r.status_code == 200
     except Exception:
         return False

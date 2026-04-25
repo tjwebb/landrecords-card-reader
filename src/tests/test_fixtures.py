@@ -10,7 +10,7 @@ of real Virginia property cards. For each PDF we:
      tolerance for floats).
 
 The tests require a reachable Ollama endpoint running the configured
-EXTRACTION_MODEL. They skip automatically if Ollama is unreachable.
+CARD_READER_EXTRACTION_MODEL. They skip automatically if Ollama is unreachable.
 
 Run:
     pytest src/utils/property_card_image_reader/tests/test_fixtures.py -v -s
@@ -26,7 +26,7 @@ from typing import Any
 import httpx
 import pytest
 
-from ..config import OLLAMA_BASE_URL
+from ..config import CARD_READER_OLLAMA_HOST
 from ..nodes import (
     download_pdf,
     extract_data,
@@ -313,16 +313,16 @@ EXPECTED_PHOTO_COUNTS: dict[str, int] = {
 def _ollama_reachable() -> bool:
     try:
         with httpx.Client(timeout=3.0) as client:
-            r = client.get(f"{OLLAMA_BASE_URL}/api/tags")
+            r = client.get(f"{CARD_READER_OLLAMA_HOST}/api/tags")
             return r.status_code == 200
     except Exception as e:
-        logger.info("Ollama not reachable at %s: %s", OLLAMA_BASE_URL, e)
+        logger.info("Ollama not reachable at %s: %s", CARD_READER_OLLAMA_HOST, e)
         return False
 
 
 pytestmark = pytest.mark.skipif(
     not _ollama_reachable(),
-    reason=f"Ollama not reachable at {OLLAMA_BASE_URL}",
+    reason=f"Ollama not reachable at {CARD_READER_OLLAMA_HOST}",
 )
 
 
