@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "landrecords-card-reader"
-version = "0.3.0"
+version = "0.3.1"
 description = "Extract structured property data from assessment card PDFs using LLM-powered text extraction"
 readme = "README.md"
 license = "MIT"
@@ -29,7 +29,7 @@ dependencies = [
     "pdfkit>=1.0.0",
     "Pillow>=10.0.0",
     "PyMuPDF>=1.24.0",
-    "pytesseract>=0.3.10",
+    "python-doctr[torch]>=0.8.0",
     "python-dotenv>=1.0.0",
 ]
 

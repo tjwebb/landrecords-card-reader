@@ -10,17 +10,11 @@ CARD_READER_EXTRACTION_MODEL = os.getenv("CARD_READER_EXTRACTION_MODEL", "gemma4
 CARD_READER_PHOTO_CLASSIFICATION_MODEL = os.getenv("CARD_READER_PHOTO_CLASSIFICATION_MODEL", "gemma4:e2b")
 
 
-# OS-level binaries the pipeline shells out to. pip-installed wrappers
-# (pytesseract, pdfkit) are useless without these on PATH, so we fail loudly
-# at import time rather than producing cryptic subprocess errors deep in the
+# OS-level binaries the pipeline shells out to. The pip-installed wrapper
+# (pdfkit) is useless without wkhtmltopdf on PATH, so we fail loudly at
+# import time rather than producing cryptic subprocess errors deep in the
 # pipeline.
 _REQUIRED_BINARIES: dict[str, dict[str, str]] = {
-    "tesseract": {
-        "purpose": "OCR for image-encoded text on property cards",
-        "macos": "brew install tesseract",
-        "debian": "apt-get install -y tesseract-ocr",
-        "url": "https://tesseract-ocr.github.io/tessdoc/Installation.html",
-    },
     "wkhtmltopdf": {
         "purpose": "rendering HTML property pages to PDF",
         "macos": "brew install --cask wkhtmltopdf",

@@ -7,15 +7,6 @@ import warnings
 
 import httpx
 
-# Pin Tesseract to single-threaded execution. Tesseract uses OpenMP
-# internally; without this, each invocation spawns its own OMP worker pool
-# and combines with our ThreadPoolExecutor to oversubscribe the CPU. With
-# OMP_THREAD_LIMIT=1, our outer per-page thread pool is the only source of
-# parallelism — predictable, no thrashing. Set before any pytesseract call
-# so the value propagates into the subprocess environment via inheritance.
-# `setdefault` preserves any explicit override the operator may have set.
-os.environ.setdefault("OMP_THREAD_LIMIT", "1")
-
 # County assessor sites often ship broken/expired certs. Silence the
 # verify=False noise so it doesn't clutter logs.
 warnings.filterwarnings("ignore", message="Unverified HTTPS request")
@@ -160,13 +151,24 @@ Field mapping guide:
     heating text -- Type of heating system in the primary building on the parcel
         (e.g. FORCED AIR, HEAT PUMP, BASEBOARD, RADIANT, WARMED & COOLED AIR).
         This describes the delivery/system type, NOT the fuel.
-    heatfuel text -- Fuel used by the heating system. Allowed values: GAS, OIL,
-        ELECTRIC, PROPANE, WOOD, SOLAR, COAL, NONE. Infer from any label that
-        names a fuel in the heating/HVAC section, e.g. "Direct-Vented, Gas",
-        "Gas Furnace", "Gas Pack", "Natural Gas" → GAS; "Oil Furnace",
-        "Fuel Oil" → OIL; "Electric Heat", "Heat Pump (Electric)", "Baseboard
-        Electric" → ELECTRIC; "LP", "Propane" → PROPANE; "Wood Stove",
-        "Woodburning" → WOOD.
+    heatfuel text -- Fuel used by the PRIMARY HEATING SYSTEM. Allowed values:
+        GAS, OIL, ELECTRIC, PROPANE, WOOD, SOLAR, COAL, NONE.
+
+        The value MUST come from a "Heat Fuel", "Heating Fuel", or "Fuel
+        Type" label in the construction-detail / HVAC section. Common
+        abbreviations: "ELECT"/"ELEC" → ELECTRIC, "LP"/"LPG"/"PROPANE" →
+        PROPANE, "Natural Gas"/"N.G."/"GAS" (when labeled as the heat
+        fuel) → GAS, "Fuel Oil"/"OIL" → OIL, "WOOD" → WOOD.
+
+        DO NOT use a fireplace's fuel as heatfuel. "B-FIREPLACE GAS",
+        "GAS FIREPLACE", "1-FIREPLACE GAS", or any "FIREPLACE <fuel>"
+        entry describes a fireplace appliance in the
+        outbuildings/features list, NOT the primary heating system.
+        Likewise, "GAS RANGE", "GAS DRYER", "GAS WATER HEATER", and other
+        appliances are not the heating fuel. If the only mention of GAS
+        on the card is in a fireplace or appliance line, do NOT set
+        heatfuel to GAS — use whatever the "Heat Fuel" label says (often
+        ELECTRIC), or omit the field entirely.
     cooling text -- Type of cooling system in the primary building on the parcel.
     foundation text -- Type of foundation of the primary building on the parcel.
     attic text -- Type of attic in the primary building on the parcel.
@@ -410,92 +412,107 @@ def download_pdf(state: AgentState) -> dict:
     return {"pdf_content": content}
 
 
-PDF_OCR_DPI = int(os.getenv("CARD_READER_OCR_DPI", "300"))
+# Cached docTR predictor. Model weights (~100MB) are downloaded to
+# ~/.cache/doctr/ on first call and re-used for subsequent OCR runs in the
+# same process. Loading is deferred until first use so importing this
+# module stays fast and doesn't pull torch into RAM unnecessarily.
+_OCR_MODEL = None
 
 
-def _ocr_pdf(content: bytes, dpi: int = PDF_OCR_DPI) -> str:
-    """Render every PDF page and OCR it as a single bitmap.
+def _get_ocr_model():
+    """Return the lazy-loaded docTR OCR predictor.
 
-    Tesseract is the sole text source. We deliberately do NOT mix in
-    pymupdf4llm output or per-image-region OCR — those paths produced
-    fragmented, layout-mangled text on county property cards. Rendering
-    each page at high DPI and OCRing the whole bitmap gives Tesseract the
-    full visual context to associate labels with their adjacent values
-    correctly.
-
-    PDF rendering is serial (PyMuPDF is not thread-safe), but the per-page
-    Tesseract calls run in parallel via a thread pool — pytesseract shells
-    out to the ``tesseract`` binary, so threads only wait on subprocess I/O.
+    Built with ``assume_straight_pages=True`` to skip the rotation-correction
+    pass — county cards are always upright, so paying for skew estimation
+    on every page is pure overhead. The predictor is moved to CUDA when
+    available; PyTorch falls back to CPU silently if the runtime has no
+    CUDA build or no usable GPU.
     """
-    import io
-    from concurrent.futures import ThreadPoolExecutor
+    global _OCR_MODEL
+    if _OCR_MODEL is None:
+        from doctr.models import ocr_predictor
+        try:
+            import torch
+            use_cuda = torch.cuda.is_available()
+        except ImportError:
+            use_cuda = False
 
-    import pymupdf as fitz
-    import pytesseract
-    from PIL import Image
+        device_label = "GPU/CUDA" if use_cuda else "CPU"
+        logger.info(
+            "Loading docTR OCR model on %s (first call: weight download + init)",
+            device_label,
+        )
+        model = ocr_predictor(pretrained=True, assume_straight_pages=True)
+        if use_cuda:
+            try:
+                model = model.cuda()
+                logger.info("docTR predictor moved to CUDA")
+            except Exception as e:
+                logger.warning(
+                    "Failed to move docTR predictor to CUDA (%s); staying on CPU", e,
+                )
+        _OCR_MODEL = model
+    return _OCR_MODEL
 
-    doc = fitz.open(stream=content, filetype="pdf")
-    try:
-        rendered: list[tuple[int, int, int, bytes]] = []
-        for page_num in range(len(doc)):
-            page = doc[page_num]
-            pix = page.get_pixmap(dpi=dpi)
-            rendered.append((page_num, pix.width, pix.height, pix.tobytes("png")))
-    finally:
-        doc.close()
 
-    if not rendered:
+def _ocr_pdf(content: bytes) -> str:
+    """OCR every PDF page via docTR and return the concatenated text.
+
+    docTR uses deep-learning detection + recognition models (default
+    db_resnet50 + crnn_vgg16_bn) which produce noticeably cleaner text on
+    busy assessor cards than Tesseract — particularly on small-font cell
+    values inside table grids. The PDF bytes are passed straight to
+    ``DocumentFile.from_pdf`` (which rasterises internally via pypdfium2);
+    we no longer pre-render via PyMuPDF.
+    """
+    from doctr.io import DocumentFile
+
+    doc = DocumentFile.from_pdf(content)
+    if not doc:
         return ""
 
-    def _ocr_one(item: tuple[int, int, int, bytes]) -> tuple[int, int, int, str]:
-        page_num, w, h, png_bytes = item
-        try:
-            img = Image.open(io.BytesIO(png_bytes))
-            text = pytesseract.image_to_string(img).strip()
-        except Exception as e:
-            logger.warning("OCR failed on page %d: %s", page_num + 1, e)
-            return page_num, w, h, ""
-        return page_num, w, h, text
-
-    if len(rendered) == 1:
-        results = [_ocr_one(rendered[0])]
-        worker_count = 1
-    else:
-        worker_count = min(len(rendered), os.cpu_count() or 4)
-        with ThreadPoolExecutor(max_workers=worker_count) as pool:
-            results = list(pool.map(_ocr_one, rendered))
+    model = _get_ocr_model()
+    result = model(doc)
 
     sections: list[str] = []
     total_chars = 0
-    for page_num, w, h, text in results:
-        if not text:
+    page_count = len(result.pages)
+    for page_idx, page in enumerate(result.pages):
+        page_text = "\n".join(
+            " ".join(word.value for word in line.words)
+            for block in page.blocks
+            for line in block.lines
+            if line.words
+        ).strip()
+        if not page_text:
             continue
-        total_chars += len(text)
+        total_chars += len(page_text)
+        h, w = page.dimensions
         logger.info(
-            "OCR page %d (%dx%d @ %d DPI) -> %d chars:\n%s",
-            page_num + 1, w, h, dpi, len(text), text,
+            "OCR page %d (%dx%d) -> %d chars:\n%s",
+            page_idx + 1, w, h, len(page_text), page_text,
         )
-        if len(rendered) > 1:
-            sections.append(f"=== Page {page_num + 1} ===\n{text}")
+        if page_count > 1:
+            sections.append(f"=== Page {page_idx + 1} ===\n{page_text}")
         else:
-            sections.append(text)
+            sections.append(page_text)
 
     combined = "\n\n".join(sections)
     if combined:
         logger.info(
-            "OCR total: %d chars across %d page(s) using %d worker(s)",
-            total_chars, len(sections), worker_count,
+            "OCR total: %d chars across %d page(s)",
+            total_chars, len(sections),
         )
     return combined
 
 
 def extract_pdf_text(state: AgentState) -> dict:
-    """OCR every page of the PDF via Tesseract and return the raw text.
+    """OCR every page of the PDF via docTR and return the raw text.
 
     The text is fed verbatim to the extraction LLM — no markdown
-    conversion, no layout reconstruction, no table parsing. Tesseract's
-    raw output preserves the spatial relationships the LLM uses to pair
-    labels with values.
+    conversion, no layout reconstruction, no table parsing. docTR's
+    word-by-line output preserves the spatial relationships the LLM uses
+    to pair labels with values.
     """
     content = state["pdf_content"]
     text = _ocr_pdf(content)
@@ -505,9 +522,9 @@ def extract_pdf_text(state: AgentState) -> dict:
 def extract_pdf_and_photos(state: AgentState) -> dict:
     """Run page-level OCR and photo classification in parallel.
 
-    Both operations open the PDF independently, so they don't contend for
-    PyMuPDF state. Each is otherwise I/O-bound (subprocess calls + Ollama
-    HTTP), so threading gets us real concurrency.
+    OCR is GPU/CPU-bound (docTR / PyTorch); photo classification is I/O
+    bound (Ollama HTTP). Both open the PDF independently so they don't
+    contend for PyMuPDF state.
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -864,30 +881,51 @@ _HEATFUEL_TOKEN_MAP: list[tuple[str, str]] = [
 ]
 
 
+# Match a specific "Heat Fuel" / "Heating Fuel" / "Fuel Type" label only —
+# NOT a bare "fuel" (which would also match "B-FIREPLACE GAS" and similar
+# fireplace/appliance entries on the card). Captures up to 25 chars of
+# value text after the label.
+_HEATFUEL_LABEL_VALUE_RE = re.compile(
+    r"\b(?:heat\s*fuel|heating\s*fuel|fuel\s*type)\b"
+    r"\s*[:\-]?\s*"
+    r"([A-Za-z./\s\-]{1,25})",
+    re.IGNORECASE,
+)
+
+
 def _post_extract_heatfuel(data: dict, text: str) -> dict:
-    """Fill heatfuel from a 'Heat Fuel' / 'Fuel Type' label in the OCR text.
+    """Reconcile heatfuel against the explicit 'Heat Fuel' label in the text.
 
-    The extraction LLM occasionally drops heatfuel even when the card clearly
-    labels it (e.g. "Heat Fuel ELECT"). This pass scans the text for the
-    label and maps the adjacent token to a canonical fuel. Already-populated
-    heatfuel values are never overwritten.
+    The card's "Heat Fuel" / "Fuel Type" cell is the ground truth for this
+    field. The LLM occasionally:
+      - drops the field entirely (silent miss), or
+      - emits the WRONG fuel because something like "B-FIREPLACE GAS"
+        appears elsewhere on the card and the model conflates a fireplace
+        appliance with the heating system.
+
+    When this pass finds a clearly-labeled value, it overwrites whatever
+    the LLM produced. The labeled value is by definition the right answer
+    — it's spelled out in the construction-detail section. We only trust
+    the LLM for heatfuel when the label cell is empty (no canonical-fuel
+    token follows the label).
     """
-    if data.get("heatfuel"):
-        return data
-
-    # Look for "Heat Fuel" / "Fuel Type" / "Fuel:" followed by a value within
-    # the next ~30 chars (same line or next line on the card).
-    label_re = re.compile(
-        r"(?:heat\s*fuel|fuel\s*type|fuel)\s*[:\-]?\s*([A-Za-z./\s-]{1,25})",
-        re.IGNORECASE,
-    )
-    for m in label_re.finditer(text):
+    for m in _HEATFUEL_LABEL_VALUE_RE.finditer(text):
         candidate = m.group(1).strip().upper()
         for pattern, canonical in _HEATFUEL_TOKEN_MAP:
             if re.search(rf"\b{pattern}\b", candidate):
-                logger.info(
-                    "heatfuel recovered from text: %r -> %s", m.group(0).strip(), canonical,
-                )
+                existing = data.get("heatfuel")
+                if existing == canonical:
+                    return data
+                if existing:
+                    logger.warning(
+                        "heatfuel overridden: LLM said %r, label %r says %s",
+                        existing, m.group(0).strip(), canonical,
+                    )
+                else:
+                    logger.info(
+                        "heatfuel recovered from label: %r -> %s",
+                        m.group(0).strip(), canonical,
+                    )
                 data["heatfuel"] = canonical
                 return data
     return data

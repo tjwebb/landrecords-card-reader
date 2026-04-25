@@ -167,9 +167,11 @@ FIXTURES: dict[str, dict[str, Any]] = {
         "heatfuel": ("any_of", ["ELECTRIC"]),
     },
     "henry_va_143010001.pdf": {
-        # taxacctnum is omitted: the printed account number ("143010001") is
-        # rasterized on the card and Tesseract reliably misreads it as
-        # "1438010001". Other high-confidence facts below cover identity.
+        # taxacctnum was omitted historically: the printed account number
+        # ("143010001") is rasterised on the card and the previous OCR
+        # backend (Tesseract) reliably misread it as "1438010001". Worth
+        # re-checking now that docTR is in use — if it reads correctly,
+        # add `"taxacctnum": ("substr", "143010001")` here.
         "ownername": ("substr", "PEREZ BUENO"),
         "ownercity": ("substr", "MARTINSVILLE"),
         "ownerstate": ("any_of", ["VA", "VIRGINIA"]),
@@ -364,7 +366,7 @@ def pipeline_result(request) -> dict:
     state.update(download_pdf(state))
     assert state["pdf_content"], "download_pdf should populate pdf_content"
 
-    # Photo extraction and text extraction (incl. Tesseract OCR) run in parallel.
+    # Photo extraction and text extraction (incl. docTR OCR) run in parallel.
     with ThreadPoolExecutor(max_workers=2) as pool:
         photos_future = pool.submit(extract_property_photos, state)
         text_future = pool.submit(extract_pdf_text, state)

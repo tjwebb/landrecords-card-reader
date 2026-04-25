@@ -13,8 +13,8 @@ pip install landrecords-card-reader
 With optional extras:
 
 ```bash
-# Tesseract OCR for image-encoded text regions
-pip install landrecords-card-reader[ocr]
+# LangGraph wiring (only needed if you want to use the graph node)
+pip install landrecords-card-reader[graph]
 
 # Everything
 pip install landrecords-card-reader[all]
@@ -24,10 +24,17 @@ pip install landrecords-card-reader[all]
 
 - **Ollama** running locally or on a remote host with a text model loaded
   (e.g. `gemma4:26b-a4b-it-q8_0`)
-- **Tesseract** (optional, for the `[ocr]` extra):
+- **wkhtmltopdf** for HTML→PDF conversion of property pages that aren't
+  served as PDFs:
   ```bash
-  sudo apt-get install tesseract-ocr
+  # macOS
+  brew install --cask wkhtmltopdf
+  # Debian/Ubuntu
+  sudo apt-get install wkhtmltopdf
   ```
+
+OCR (docTR + PyTorch) ships as a Python dependency; the model weights
+(~100MB) are downloaded to `~/.cache/doctr/` on first call.
 
 ## Quick start
 
@@ -107,9 +114,11 @@ The extraction prompt maps over 80 property card fields including:
 
 1. **Download** the PDF (or accept pre-downloaded bytes)
 2. **In parallel**:
-   - **OCR every page** via Tesseract — each page is rendered at 300 DPI
-     (configurable via `CARD_READER_OCR_DPI`) and OCR'd as a single bitmap;
-     pages run in parallel via a thread pool
+   - **OCR every page** via docTR — PDF bytes are passed straight to
+     `DocumentFile.from_pdf` (rasterised internally via pypdfium2) and run
+     through docTR's deep-learning detection + recognition models in a
+     single batched inference call. The predictor uses
+     `assume_straight_pages=True` and runs on CUDA when available
    - **Extract & classify property photos** — candidate images are filtered
      by size/aspect ratio, then sent to a vision model to keep only actual
      photographs (discarding sketches, floorplans, maps, etc.)
