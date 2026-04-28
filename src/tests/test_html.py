@@ -50,10 +50,48 @@ pytestmark = [
 
 @pytest.fixture(scope="module")
 def pulaski_result():
-    """Run the full pipeline against the Pulaski County HTML property card."""
-    from .. import read_property_card
+    """Run the full pipeline against the Pulaski County HTML property card.
 
-    data, photo = read_property_card(PULASKI_URL, analyze_photo=True)
+    Calls each pipeline step directly (rather than the high-level
+    ``read_property_card``) so the raw OCR text can be logged for
+    inspection — this card has historically caused glyph-merging issues
+    in the HTML→PDF→OCR path (e.g. "511E BROWNTOWNF RD") and the OCR
+    output is the single most useful artifact for debugging them.
+    """
+    from ..nodes import (
+        download_pdf,
+        extract_data,
+        extract_pdf_and_photos,
+        fill_from_photo,
+    )
+
+    state: dict = {
+        "pdf_url": PULASKI_URL,
+        "pdf_bytes": None,
+        "pdf_content": b"",
+        "pdf_text": "",
+        "property_photos": [],
+        "property_data": {},
+        "result": "",
+        "context": None,
+    }
+
+    state.update(download_pdf(state))
+    state.update(extract_pdf_and_photos(state))
+
+    logger.info(
+        "=== Pulaski OCR text (%d chars) ===\n%s\n=== end Pulaski OCR text ===",
+        len(state["pdf_text"]), state["pdf_text"],
+    )
+
+    state.update(extract_data(state))
+
+    photos = state.get("property_photos", [])
+    photo = photos[0]["bytes"] if photos else None
+    data = state["property_data"]
+    if photo:
+        data = fill_from_photo(data, photo)
+
     logger.info("Extracted data:\n%s", json.dumps(data, indent=2, default=str))
     return data, photo
 

@@ -14,9 +14,32 @@ Usage:
     from landrecords_card_reader import read_property_card_from_url
 
     data, photo = read_property_card_from_url("https://beacon.schneidercorp.com/...")
+
+    # Pre-warm the OCR model cache (avoid first-call download latency in
+    # short-lived workers, e.g. Ray actors). Idempotent — re-uses an
+    # already-loaded predictor on subsequent calls.
+    from landrecords_card_reader import warm_ocr_cache
+    warm_ocr_cache()
 """
 
 from .state import AgentState
+
+
+def warm_ocr_cache() -> None:
+    """Force-load the docTR OCR model so subsequent calls skip the download.
+
+    Useful when:
+      - The hosting environment spawns short-lived Python workers (Ray,
+        Lambda, Celery) and the per-process startup latency is visible.
+      - You want to fail fast on first deploy if model weights can't be
+        fetched (e.g. behind a strict egress firewall).
+
+    The model is cached in ``$DOCTR_CACHE_DIR`` (default ``~/.cache/doctr/``).
+    Set ``DOCTR_CACHE_DIR`` to a persistent / shared path before calling
+    this so multiple workers can share the same downloaded weights.
+    """
+    from .nodes import _get_ocr_model
+    _get_ocr_model()
 
 
 def read_property_card(

@@ -151,6 +151,8 @@ Field mapping guide:
     heating text -- Type of heating system in the primary building on the parcel
         (e.g. FORCED AIR, HEAT PUMP, BASEBOARD, RADIANT, WARMED & COOLED AIR).
         This describes the delivery/system type, NOT the fuel.
+        Sometimes labeled as "HVAC".
+
     heatfuel text -- Fuel used by the PRIMARY HEATING SYSTEM. Allowed values:
         GAS, OIL, ELECTRIC, PROPANE, WOOD, SOLAR, COAL, NONE.
 
@@ -169,7 +171,8 @@ Field mapping guide:
         on the card is in a fireplace or appliance line, do NOT set
         heatfuel to GAS — use whatever the "Heat Fuel" label says (often
         ELECTRIC), or omit the field entirely.
-    cooling text -- Type of cooling system in the primary building on the parcel.
+
+    cooling text -- Type of cooling system in the primary building on the parcel.  Sometimes labeled as "HVAC".
     foundation text -- Type of foundation of the primary building on the parcel.
     attic text -- Type of attic in the primary building on the parcel.
     atticsqft int4 -- Square footage of the attic in the primary building on the parcel.
@@ -224,6 +227,11 @@ Rules:
 - Dates must be in YYYY-MM-DD format.
 - Numeric fields must be numbers, not strings.
 - It's okay if data is missing, but do not guess or fabricate data.
+- "NONE" is a real value, NOT a placeholder. Only emit "NONE" for a field
+  when the card EXPLICITLY shows the literal text "NONE" (or "None") as
+  that field's value. If a field's cell is blank, dashed, empty,
+  whitespace-only, or absent — OMIT the field entirely. Do not substitute
+  "NONE" / "N/A" / "UNKNOWN" / "" / 0 for missing data.
 - parcelid, parcelid2, and taxacctnum cannot be equal to each other, or any other value on the card.
 
 DOCUMENT TEXT:
@@ -306,6 +314,12 @@ def _parse_json_response(text: str) -> dict:
     raise json.JSONDecodeError("No JSON object found in response", text, 0)
 
 
+# Placeholder strings the LLM occasionally emits despite being told to omit
+# missing fields. These are NEVER kept; "NONE" is allowed only if the OCR
+# text explicitly contains it (verified separately by _drop_unverified_none).
+_PLACEHOLDER_STRINGS = {"N/A", "NA", "UNKNOWN", "UNK", "NULL", "-", "--"}
+
+
 def _coerce_types(data: dict) -> dict:
     """Coerce extracted values to their expected Python types."""
     int_fields = {
@@ -335,6 +349,10 @@ def _coerce_types(data: dict) -> dict:
             else:
                 if isinstance(v, str) and v.strip():
                     upper = v.strip().upper()
+                    if upper in _PLACEHOLDER_STRINGS:
+                        # LLM-emitted placeholder for a missing value —
+                        # drop it; absence is more honest than a fake.
+                        continue
                     if upper in ("YES", "TRUE"):
                         coerced[k] = True
                     elif upper in ("NO", "FALSE"):
@@ -412,11 +430,26 @@ def download_pdf(state: AgentState) -> dict:
     return {"pdf_content": content}
 
 
-# Cached docTR predictor. Model weights (~100MB) are downloaded to
+# Cached docTR predictor. Model weights (~100MB+) are downloaded to
 # ~/.cache/doctr/ on first call and re-used for subsequent OCR runs in the
 # same process. Loading is deferred until first use so importing this
 # module stays fast and doesn't pull torch into RAM unnecessarily.
 _OCR_MODEL = None
+
+# OCR architecture — sticking with docTR's historical defaults
+# (db_resnet50 + crnn_vgg16_bn). They are fast, well-supported, and on the
+# scaled-up renders the dense table grids parse cleanly without needing a
+# heavier transformer recognition model.
+_OCR_DET_ARCH = os.getenv("CARD_READER_OCR_DET_ARCH", "db_resnet50")
+_OCR_RECO_ARCH = os.getenv("CARD_READER_OCR_RECO_ARCH", "crnn_vgg16_bn")
+
+# pypdfium2 render scale used by DocumentFile.from_pdf. Default 2 (~144 DPI)
+# is too low for the dense table grids on county property cards — adjacent
+# cell glyphs touch in the rasterised image and the recognition model
+# emits spurious characters ("511E BROWNTOWNF" instead of "511 BROWNTOWN").
+# Scale 4 ≈ 288 DPI is a good quality/cost balance; bump higher for cards
+# with very small font sizes.
+_OCR_RENDER_SCALE = float(os.getenv("CARD_READER_OCR_RENDER_SCALE", "4"))
 
 
 def _get_ocr_model():
@@ -439,10 +472,16 @@ def _get_ocr_model():
 
         device_label = "GPU/CUDA" if use_cuda else "CPU"
         logger.info(
-            "Loading docTR OCR model on %s (first call: weight download + init)",
-            device_label,
+            "Loading docTR OCR model on %s (det=%s, reco=%s) "
+            "(first call: weight download + init)",
+            device_label, _OCR_DET_ARCH, _OCR_RECO_ARCH,
         )
-        model = ocr_predictor(pretrained=True, assume_straight_pages=True)
+        model = ocr_predictor(
+            det_arch=_OCR_DET_ARCH,
+            reco_arch=_OCR_RECO_ARCH,
+            pretrained=True,
+            assume_straight_pages=True,
+        )
         if use_cuda:
             try:
                 model = model.cuda()
@@ -458,16 +497,16 @@ def _get_ocr_model():
 def _ocr_pdf(content: bytes) -> str:
     """OCR every PDF page via docTR and return the concatenated text.
 
-    docTR uses deep-learning detection + recognition models (default
+    docTR uses deep-learning detection + recognition models (defaults:
     db_resnet50 + crnn_vgg16_bn) which produce noticeably cleaner text on
     busy assessor cards than Tesseract — particularly on small-font cell
     values inside table grids. The PDF bytes are passed straight to
-    ``DocumentFile.from_pdf`` (which rasterises internally via pypdfium2);
-    we no longer pre-render via PyMuPDF.
+    ``DocumentFile.from_pdf`` (which rasterises internally via pypdfium2)
+    at scale ``CARD_READER_OCR_RENDER_SCALE`` (default 4, ~288 DPI).
     """
     from doctr.io import DocumentFile
 
-    doc = DocumentFile.from_pdf(content)
+    doc = DocumentFile.from_pdf(content, scale=_OCR_RENDER_SCALE)
     if not doc:
         return ""
 
@@ -488,10 +527,6 @@ def _ocr_pdf(content: bytes) -> str:
             continue
         total_chars += len(page_text)
         h, w = page.dimensions
-        logger.info(
-            "OCR page %d (%dx%d) -> %d chars:\n%s",
-            page_idx + 1, w, h, len(page_text), page_text,
-        )
         if page_count > 1:
             sections.append(f"=== Page {page_idx + 1} ===\n{page_text}")
         else:
@@ -566,9 +601,6 @@ def _is_property_photo(image_bytes: bytes) -> bool:
         }],
         "stream": False,
         "think": False,
-        "options": {
-            "visual_token_budget": 70,
-        },
     }
 
     try:
@@ -830,13 +862,11 @@ def fill_from_photo(data: dict, image_bytes: bytes) -> dict:
     logger.info("Analyzing property photo for %d missing field(s)", len(missing))
 
     try:
-        # Use Ollama directly to set visual_token_budget for gemma4 models.
         payload = {
             "model": CARD_READER_EXTRACTION_MODEL,
             "messages": [{"role": "user", "content": prompt, "images": [b64]}],
             "stream": False,
             "think": False,
-            "options": {"visual_token_budget": 1120},
         }
         with httpx.Client(base_url=CARD_READER_OLLAMA_HOST, timeout=300) as client:
             resp = client.post("/api/chat", json=payload)
@@ -1119,6 +1149,10 @@ CRITICAL rules — read carefully:
   a value from one field as the value for another (e.g. a "Primary Use"
   code is never a "Zoning Code", a "Year Remodeled" is never the
   "Year Built").
+- "NONE" is a real value, NOT a placeholder. Only emit "NONE" for a field
+  when the card EXPLICITLY shows the literal text "NONE" (or "None") as
+  that field's value. If the cell is blank, dashed, or empty, OMIT the
+  field — do not substitute "NONE" / "N/A" / "UNKNOWN" / "" / 0.
 - Return ONLY a JSON object containing only the fields you can confidently
   fill in. Numeric fields must be numbers (no $, no commas). Dates must be
   YYYY-MM-DD.
@@ -1231,6 +1265,34 @@ def _retry_missing_labeled_fields(data: dict, text: str) -> dict:
     return data
 
 
+def _drop_unverified_none(data: dict, text: str) -> dict:
+    """Strip "NONE" string values that the OCR text doesn't actually contain.
+
+    The LLM is told to emit "NONE" only when the card explicitly shows that
+    literal value, but it occasionally substitutes "NONE" for missing data
+    anyway (especially for heatfuel/cooling/basement). If the word "NONE"
+    or "None" doesn't appear as a token in the OCR text, the value is a
+    fabrication and we drop it.
+    """
+    if not text:
+        return data
+    text_has_none = re.search(r"\bnone\b", text, re.IGNORECASE) is not None
+    if text_has_none:
+        return data
+    dropped: list[str] = []
+    for k in list(data.keys()):
+        v = data[k]
+        if isinstance(v, str) and v.strip().upper() == "NONE":
+            del data[k]
+            dropped.append(k)
+    if dropped:
+        logger.info(
+            "Dropped %d unverified 'NONE' value(s): %s",
+            len(dropped), ", ".join(dropped),
+        )
+    return data
+
+
 def extract_data(state: AgentState) -> dict:
     """Extract structured property data from the OCR'd PDF text."""
     text = state.get("pdf_text", "") or ""
@@ -1246,5 +1308,6 @@ def extract_data(state: AgentState) -> dict:
     data = _retry_parcelid(data, text)
     data = _post_extract_heatfuel(data, text)
     data = _retry_missing_labeled_fields(data, text)
+    data = _drop_unverified_none(data, text)
     logger.info("Extracted %d fields from PDF text", len(data))
     return {"property_data": data}
