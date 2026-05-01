@@ -60,12 +60,6 @@ packages = ["landrecords_card_reader", "landrecords_card_reader.tests"]
 "landrecords_card_reader" = "src"
 "landrecords_card_reader.tests" = "src/tests"
 
-# Bundle pre-downloaded docTR weights so the wheel doesn't need network
-# access on first OCR call. Run `prefetch_doctr_models()` (or publish.sh)
-# before `python -m build` to populate src/doctr_cache/models/*.pt.
-[tool.setuptools.package-data]
-"landrecords_card_reader" = ["doctr_cache/models/*.pt"]
-
 [tool.pytest.ini_options]
 log_cli = true
 log_cli_level = "INFO"

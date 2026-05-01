@@ -21,7 +21,7 @@ from ..config import CARD_READER_OLLAMA_HOST
 
 logger = logging.getLogger(__name__)
 
-PULASKI_URL = "https://www.webgis.net/LinkedFiles/va/pulaski/pc/cards/PC17759.htm"
+PULASKI_URL = "https://www.webgis.net/LinkedFiles/va/pulaski/pc/cards/PC19961.htm"
 
 
 def _ollama_reachable() -> bool:
@@ -105,19 +105,19 @@ class TestHtmlPropertyCard:
     def test_parcelid(self, pulaski_result):
         data, _ = pulaski_result
         pid = str(data.get("parcelid", "")).upper()
-        assert "072-051-0027-008A" in pid or "072" in pid, (
-            f"parcelid: expected to contain '072-051-0027-008A', got {pid!r}"
+        assert "072-096-0000-0001" in pid or "072-096" in pid, (
+            f"parcelid: expected to contain '072-096-0000-0001', got {pid!r}"
         )
 
     def test_ownername(self, pulaski_result):
         data, _ = pulaski_result
         owner = str(data.get("ownername", "")).upper()
-        assert "ROSSI" in owner, f"ownername: expected to contain 'ROSSI', got {owner!r}"
+        assert "ALTIS" in owner, f"ownername: expected to contain 'ALTIS', got {owner!r}"
 
     def test_parceladdr(self, pulaski_result):
         data, _ = pulaski_result
         addr = str(data.get("parceladdr", "")).upper()
-        assert "7TH" in addr, f"parceladdr: expected to contain '7TH', got {addr!r}"
+        assert "RIDGE" in addr, f"parceladdr: expected to contain 'RIDGE', got {addr!r}"
 
     def test_parcelstate(self, pulaski_result):
         data, _ = pulaski_result
@@ -127,17 +127,17 @@ class TestHtmlPropertyCard:
     def test_landvalue(self, pulaski_result):
         data, _ = pulaski_result
         land = data.get("landvalue")
-        assert land == 17000, f"landvalue: expected 17000, got {land!r}"
+        assert land == 12000, f"landvalue: expected 12000, got {land!r}"
 
     def test_imprvalue(self, pulaski_result):
         data, _ = pulaski_result
         impr = data.get("imprvalue")
-        assert impr == 96600, f"imprvalue: expected 96600, got {impr!r}"
+        assert impr == 58200, f"imprvalue: expected 58200, got {impr!r}"
 
     def test_totalvalue(self, pulaski_result):
         data, _ = pulaski_result
         total = data.get("totalvalue")
-        assert total == 113600, f"totalvalue: expected 113600, got {total!r}"
+        assert total == 70200, f"totalvalue: expected 70200, got {total!r}"
 
     def test_value_consistency(self, pulaski_result):
         data, _ = pulaski_result
@@ -152,7 +152,25 @@ class TestHtmlPropertyCard:
     def test_zoningcode(self, pulaski_result):
         data, _ = pulaski_result
         zoning = str(data.get("zoningcode", "")).upper()
-        assert "R2" in zoning, f"zoningcode: expected to contain 'R2', got {zoning!r}"
+        assert "R4" in zoning, f"zoningcode: expected to contain 'R4', got {zoning!r}"
+
+    def test_heating_is_heat_pump(self, pulaski_result):
+        """Card explicitly says 'Primary Heat: Heat pump'."""
+        data, _ = pulaski_result
+        heating = str(data.get("heating", "")).upper()
+        assert "HEAT PUMP" in heating, (
+            f"heating: expected 'HEAT PUMP', got {heating!r}"
+        )
+
+    def test_cooling_is_present(self, pulaski_result):
+        """Air Cond row shows 1100 sqft on the main floor — AC is present.
+        With heating=HEAT PUMP, the same unit cools (HEAT PUMP)."""
+        data, _ = pulaski_result
+        cooling = str(data.get("cooling", "")).upper()
+        assert cooling, f"cooling: expected non-empty, got {cooling!r}"
+        assert "HEAT PUMP" in cooling or "CENTRAL" in cooling, (
+            f"cooling: expected HEAT PUMP or CENTRAL AIR, got {cooling!r}"
+        )
 
     def test_print_data(self, pulaski_result, capsys):
         data, photo = pulaski_result

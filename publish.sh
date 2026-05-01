@@ -32,14 +32,6 @@ echo "Publishing version: ${VERSION}"
 
 python -m pip install --quiet --upgrade build twine
 
-# Pre-download docTR weights into src/doctr_cache/models/ so the wheel
-# ships with them and end users don't fetch from doctr-static.mindee.com
-# on first OCR call. Idempotent — skips files already on disk. Uses an
-# editable install so the package's relative imports resolve.
-echo "Prefetching docTR model weights..."
-python -m pip install --quiet -e .
-python -c "from landrecords_card_reader import prefetch_doctr_models; prefetch_doctr_models()"
-
 rm -rf dist build ./*.egg-info
 python -m build
 

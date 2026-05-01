@@ -1,11 +1,11 @@
-"""Integration test against the Henry County (NC) hcama property card.
+"""Integration test against a Henry County (VA) hcama property card.
 
 Requires:
 - Ollama running at CARD_READER_OLLAMA_HOST with the configured extraction model
 - Network access to download the example PDF
 
 Run:
-    pytest src/tests/test_hcama.py -v -s
+    pytest src/tests/test_henry_va_hcama.py -v -s
 """
 
 import json

@@ -170,6 +170,14 @@ Field mapping guide:
         GAS", "1-FIREPLACE") with the heating system. Those are features in
         the outbuildings/extras list, not the primary heating delivery.
 
+        Some cards (e.g. Henry County VA InteractiveGIS) do NOT spell out a
+        heating delivery label — they only show a "Heat Fuel" / "Fuel Type"
+        cell paired with a "Central Air" / "Central A/C %" / "AC %" cell
+        carrying a nonzero value. In that case the building has a CENTRAL
+        forced-air HVAC system that does both heating and cooling — emit
+        heating="CENTRAL AIR" (and cooling="CENTRAL AIR" per the cooling
+        rules below).
+
     heatfuel text -- Fuel used by the PRIMARY HEATING SYSTEM. Allowed values:
         GAS, OIL, ELECTRIC, PROPANE, WOOD, SOLAR, COAL, NONE.
 
@@ -274,6 +282,7 @@ Rules:
   whitespace-only, or absent — OMIT the field entirely. Do not substitute
   "NONE" / "N/A" / "UNKNOWN" / "" / 0 for missing data.
 - parcelid, parcelid2, and taxacctnum cannot be equal to each other, or any other value on the card.
+- heating and heatfuel cannot be equal to each other
 
 DOCUMENT TEXT:
 {document_text}"""
@@ -471,12 +480,10 @@ def download_pdf(state: AgentState) -> dict:
     return {"pdf_content": content}
 
 
-# Cached docTR predictor. Model weights (~100MB+) are loaded from the
-# package-bundled cache when present (see _activate_bundled_doctr_cache),
-# otherwise downloaded to ~/.cache/doctr/ on first call. Cached predictor
-# is re-used for subsequent OCR runs in the same process. Loading is
-# deferred until first use so importing this module stays fast and doesn't
-# pull torch into RAM unnecessarily.
+# Cached docTR predictor. Model weights (~100MB+) are downloaded to
+# ~/.cache/doctr/ on first call and re-used for subsequent OCR runs in the
+# same process. Loading is deferred until first use so importing this
+# module stays fast and doesn't pull torch into RAM unnecessarily.
 _OCR_MODEL = None
 
 # OCR architecture — sticking with docTR's historical defaults
@@ -485,67 +492,6 @@ _OCR_MODEL = None
 # heavier transformer recognition model.
 _OCR_DET_ARCH = os.getenv("CARD_READER_OCR_DET_ARCH", "db_resnet50")
 _OCR_RECO_ARCH = os.getenv("CARD_READER_OCR_RECO_ARCH", "crnn_vgg16_bn")
-
-# Package-bundled docTR cache. When the wheel ships with weights pre-placed
-# under <package>/doctr_cache/models/, point DOCTR_CACHE_DIR there so docTR
-# uses them instead of fetching from doctr-static.mindee.com on first call.
-# The expected file names match what docTR's ``download_from_url`` derives
-# from the URLs in default_cfgs (the trailing ``-<hash>.pt`` segment).
-_BUNDLED_DOCTR_DIR = os.path.join(os.path.dirname(__file__), "doctr_cache")
-_BUNDLED_MODEL_FILES = {
-    "db_resnet50": "db_resnet50-79bd7d70.pt",
-    "crnn_vgg16_bn": "crnn_vgg16_bn-0417f351.pt",
-}
-
-
-def _activate_bundled_doctr_cache() -> bool:
-    """Point DOCTR_CACHE_DIR at the package-bundled cache when complete.
-
-    Returns True if the bundled cache was activated (or was already in
-    use), False if the bundle is missing files and we fell through to
-    docTR's default behavior. A user-set DOCTR_CACHE_DIR is always
-    honored — we only set it when unset.
-    """
-    if os.environ.get("DOCTR_CACHE_DIR"):
-        return False
-
-    needed = [_BUNDLED_MODEL_FILES[a] for a in (_OCR_DET_ARCH, _OCR_RECO_ARCH)
-              if a in _BUNDLED_MODEL_FILES]
-    if not needed:
-        return False
-
-    models_dir = os.path.join(_BUNDLED_DOCTR_DIR, "models")
-    if not all(os.path.isfile(os.path.join(models_dir, fn)) for fn in needed):
-        return False
-
-    os.environ["DOCTR_CACHE_DIR"] = _BUNDLED_DOCTR_DIR
-    logger.info("Using bundled docTR weights from %s", _BUNDLED_DOCTR_DIR)
-    return True
-
-
-def prefetch_doctr_models() -> None:
-    """Download docTR weights into the package-bundled cache directory.
-
-    Intended as a build-time step (run once before ``python -m build`` so
-    the wheel ships with the weights). The download is a no-op when the
-    expected files are already present and pass the hash check that
-    docTR's downloader performs internally.
-    """
-    os.environ["DOCTR_CACHE_DIR"] = _BUNDLED_DOCTR_DIR
-    os.makedirs(os.path.join(_BUNDLED_DOCTR_DIR, "models"), exist_ok=True)
-
-    from doctr.models import ocr_predictor
-
-    logger.info(
-        "Prefetching docTR weights into %s (det=%s, reco=%s)",
-        _BUNDLED_DOCTR_DIR, _OCR_DET_ARCH, _OCR_RECO_ARCH,
-    )
-    ocr_predictor(
-        det_arch=_OCR_DET_ARCH,
-        reco_arch=_OCR_RECO_ARCH,
-        pretrained=True,
-        assume_straight_pages=True,
-    )
 
 # pypdfium2 render scale used by DocumentFile.from_pdf. Default 2 (~144 DPI)
 # is too low for the dense table grids on county property cards — adjacent
@@ -567,7 +513,6 @@ def _get_ocr_model():
     """
     global _OCR_MODEL
     if _OCR_MODEL is None:
-        _activate_bundled_doctr_cache()
         from doctr.models import ocr_predictor
         try:
             import torch
@@ -599,60 +544,153 @@ def _get_ocr_model():
     return _OCR_MODEL
 
 
-def _ocr_pdf(content: bytes) -> str:
-    """OCR every PDF page via docTR and return the concatenated text.
+# Per-page threshold: a page that returns at least this many non-whitespace
+# chars from pymupdf's get_text() AND passes the informativeness check is
+# treated as having a real text layer and is read directly (no OCR).
+# Below the chars threshold the page is assumed scanned/image-only.
+# 100 chars is loose enough that a minimal cover-page text layer counts as
+# "has text" but tight enough that a few stray glyphs from a scanned page
+# don't suppress OCR.
+_NATIVE_TEXT_MIN_CHARS = 100
 
-    docTR uses deep-learning detection + recognition models (defaults:
-    db_resnet50 + crnn_vgg16_bn) which produce noticeably cleaner text on
-    busy assessor cards than Tesseract — particularly on small-font cell
-    values inside table grids. The PDF bytes are passed straight to
-    ``DocumentFile.from_pdf`` (which rasterises internally via pypdfium2)
-    at scale ``CARD_READER_OCR_RENDER_SCALE`` (default 4, ~288 DPI).
+# Minimum fraction of non-empty lines that must look "informative"
+# (multi-word, or label/value pair on the same line). Defends against
+# degenerate text layers — e.g. Henry County VA InteractiveGIS cards
+# place label boxes and value boxes as independent text objects, so
+# pymupdf returns a stream of disconnected single-word labels with no
+# values attached. Such text passes the chars threshold but is useless
+# for extraction; we should OCR those pages instead.
+_NATIVE_TEXT_MIN_INFORMATIVE_RATIO = 0.20
+
+
+def _is_native_text_useful(text: str) -> bool:
+    """Decide whether a page's native text layer carries enough structure
+    to be used in place of OCR. See ``_NATIVE_TEXT_MIN_CHARS`` and
+    ``_NATIVE_TEXT_MIN_INFORMATIVE_RATIO`` for the thresholds.
     """
+    if len(text) < _NATIVE_TEXT_MIN_CHARS:
+        return False
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    if not lines:
+        return False
+    informative = sum(
+        1
+        for l in lines
+        if len(l.split()) >= 3
+        or (
+            len(l.split()) >= 2
+            and re.search(r"[A-Za-z]", l)
+            and re.search(r"\d", l)
+        )
+    )
+    return (informative / len(lines)) >= _NATIVE_TEXT_MIN_INFORMATIVE_RATIO
+
+
+def _ocr_page_images(images: list[bytes]) -> list[str]:
+    """Run docTR over a list of pre-rendered page images (PNG bytes) and
+    return one text block per image, in the same order."""
     from doctr.io import DocumentFile
 
-    doc = DocumentFile.from_pdf(content, scale=_OCR_RENDER_SCALE)
-    if not doc:
-        return ""
-
+    if not images:
+        return []
+    doc_for_ocr = DocumentFile.from_images(images)
     model = _get_ocr_model()
-    result = model(doc)
+    result = model(doc_for_ocr)
 
-    sections: list[str] = []
-    total_chars = 0
-    page_count = len(result.pages)
-    for page_idx, page in enumerate(result.pages):
+    out: list[str] = []
+    for page in result.pages:
         page_text = "\n".join(
             " ".join(word.value for word in line.words)
             for block in page.blocks
             for line in block.lines
             if line.words
         ).strip()
-        if not page_text:
+        out.append(page_text)
+    return out
+
+
+def _ocr_pdf(content: bytes) -> str:
+    """Extract per-page text from the PDF, using OCR only where required.
+
+    For each page, pymupdf's ``get_text()`` is tried first. When the page
+    has a usable native text layer (>= _NATIVE_TEXT_MIN_CHARS of non-
+    whitespace text), that text is used verbatim — it's faster, lossless,
+    and free of OCR errors on small glyphs.
+
+    Pages without a usable text layer (typical of scanned cards or pages
+    where the text is baked into a raster image) are rendered to PNG at
+    ``CARD_READER_OCR_RENDER_SCALE`` (~288 DPI by default) and run through
+    docTR (db_resnet50 + crnn_vgg16_bn defaults). Only those pages pay the
+    OCR cost; pages with a native text layer skip the model entirely.
+
+    Returned text follows original page order, with ``=== Page N ===``
+    headers when the document has more than one populated page.
+    """
+    import pymupdf as fitz
+
+    doc = fitz.open(stream=content, filetype="pdf")
+    page_texts: list[str | None] = []
+    pages_needing_ocr: list[int] = []
+    rendered_images: list[bytes] = []
+
+    try:
+        dpi = int(72 * _OCR_RENDER_SCALE)
+        for i in range(len(doc)):
+            native = (doc[i].get_text() or "").strip()
+            if _is_native_text_useful(native):
+                page_texts.append(native)
+            else:
+                page_texts.append(None)
+                pages_needing_ocr.append(i)
+                rendered_images.append(doc[i].get_pixmap(dpi=dpi).tobytes("png"))
+    finally:
+        doc.close()
+
+    native_count = len(page_texts) - len(pages_needing_ocr)
+    if pages_needing_ocr:
+        logger.info(
+            "PDF text: %d/%d page(s) have a native text layer; OCRing the "
+            "remaining %d page(s) without one",
+            native_count, len(page_texts), len(pages_needing_ocr),
+        )
+        ocr_texts = _ocr_page_images(rendered_images)
+        for idx, text in zip(pages_needing_ocr, ocr_texts):
+            page_texts[idx] = text
+    else:
+        logger.info(
+            "PDF text: native text layer found on all %d page(s); skipping OCR",
+            len(page_texts),
+        )
+
+    sections: list[str] = []
+    total_chars = 0
+    populated = sum(1 for t in page_texts if t)
+    for i, text in enumerate(page_texts):
+        if not text:
             continue
-        total_chars += len(page_text)
-        h, w = page.dimensions
-        if page_count > 1:
-            sections.append(f"=== Page {page_idx + 1} ===\n{page_text}")
+        total_chars += len(text)
+        if populated > 1:
+            sections.append(f"=== Page {i + 1} ===\n{text}")
         else:
-            sections.append(page_text)
+            sections.append(text)
 
     combined = "\n\n".join(sections)
     if combined:
         logger.info(
-            "OCR total: %d chars across %d page(s)",
-            total_chars, len(sections),
+            "PDF text total: %d chars across %d page(s)",
+            total_chars, populated,
         )
     return combined
 
 
 def extract_pdf_text(state: AgentState) -> dict:
-    """OCR every page of the PDF via docTR and return the raw text.
+    """Extract text from the PDF, preferring the native text layer.
 
-    The text is fed verbatim to the extraction LLM — no markdown
-    conversion, no layout reconstruction, no table parsing. docTR's
-    word-by-line output preserves the spatial relationships the LLM uses
-    to pair labels with values.
+    Pages with a usable native text layer are read directly via pymupdf;
+    only pages without one (scanned / image-only) are rasterised and
+    OCR'd via docTR. The combined per-page text is fed verbatim to the
+    extraction LLM — no markdown conversion, no layout reconstruction,
+    no table parsing.
     """
     content = state["pdf_content"]
     text = _ocr_pdf(content)

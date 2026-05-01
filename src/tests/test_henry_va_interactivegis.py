@@ -1,11 +1,11 @@
-"""Integration test for the land records card reader pipeline.
+"""Integration test against a Henry County (VA) interactiveGIS land card.
 
 Requires:
 - Ollama running at CARD_READER_OLLAMA_HOST with the configured extraction model
 - Network access to download the example PDF
 
 Run:
-    pytest test_integration.py -v -s
+    pytest src/tests/test_henry_va_interactivegis.py -v -s
 """
 
 import json
@@ -83,6 +83,30 @@ class TestExtractData:
     def test_returns_dict(self, extracted_state):
         data = extracted_state["property_data"]
         assert isinstance(data, dict)
+
+    def test_heatfuel_electric(self, extracted_state):
+        """Card shows 'Heat Fuel ELECT' — heatfuel must be ELECTRIC."""
+        data = extracted_state["property_data"]
+        fuel = str(data.get("heatfuel", "")).upper()
+        assert fuel == "ELECTRIC", f"heatfuel: expected ELECTRIC, got {fuel!r}"
+
+    def test_heating_central_air(self, extracted_state):
+        """Henry InteractiveGIS cards have no separate heating-delivery
+        label — the only HVAC indicators are 'Heat Fuel' + 'Central Air %'.
+        Both heating and cooling must resolve to CENTRAL AIR."""
+        data = extracted_state["property_data"]
+        heating = str(data.get("heating", "")).upper()
+        assert "CENTRAL" in heating, (
+            f"heating: expected to contain 'CENTRAL', got {heating!r}"
+        )
+
+    def test_cooling_central_air(self, extracted_state):
+        """Card shows 'Central Air % 100' — cooling must be CENTRAL AIR."""
+        data = extracted_state["property_data"]
+        cooling = str(data.get("cooling", "")).upper()
+        assert "CENTRAL" in cooling, (
+            f"cooling: expected to contain 'CENTRAL', got {cooling!r}"
+        )
 
     def test_print_extracted_data(self, extracted_state):
         """Not a real assertion — prints extracted data for manual review."""
