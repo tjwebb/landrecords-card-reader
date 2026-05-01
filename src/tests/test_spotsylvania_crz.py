@@ -100,11 +100,11 @@ class TestSpotsylvaniaCRZ:
 
     def test_landvalue(self, crz_result):
         data, _ = crz_result
-        assert data.get("landvalue") == 115000, f"landvalue: got {data.get('landvalue')!r}"
+        assert data.get("landvalue") == 135000, f"landvalue: got {data.get('landvalue')!r}"
 
     def test_totalvalue(self, crz_result):
         data, _ = crz_result
-        assert data.get("totalvalue") == 308300, f"totalvalue: got {data.get('totalvalue')!r}"
+        assert data.get("totalvalue") == 350900, f"totalvalue: got {data.get('totalvalue')!r}"
 
     def test_value_consistency(self, crz_result):
         data, _ = crz_result

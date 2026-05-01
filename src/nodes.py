@@ -70,7 +70,19 @@ Field mapping guide:
     usecode text -- The land use code assigned to the parcel.
     usedesc text -- A description of the land use associated with the parcel.
 
-    zoningcode text -- The zoning code assigned to the parcel.
+    zoningcode text -- The zoning code assigned to the parcel — the
+        municipal/county zoning classification, e.g. "SF-2", "R-1",
+        "A1", "PUD", "C-2", "MF-3", "PUL_R4".
+
+        Look for the value next to a "Zoning" / "Zoning Code" label.
+        Prefer the LONGER, more specific code when several short
+        candidates appear nearby — most jurisdictions use a letter
+        prefix + numeric/dashed suffix (SF-2, R-1, MF-3). A bare
+        single-letter code like "R" is almost never the full zoning
+        code; on Travis County TX cards a bare "R" is the residential
+        property TYPE class, listed adjacent to but distinct from the
+        "Zoning: SF-2" cell. When you see "Zoning: SF-2" followed by
+        another single-letter code, ALWAYS pick "SF-2".
     zoningdesc text -- A description of the zoning associated with the parcel.
     numbldgs int4 -- Number of buildings on the parcel.
     numunits int4 -- Number of units on the parcel.
@@ -79,25 +91,77 @@ Field mapping guide:
         YearBuilt, EffYr, Year Effective, Remodeled), always use YrBlt /
         Year Built / Original Year. Never use YrEff, EffYr, or "effective
         year" — that is a depreciation-adjusted year, not the build year.
-    bldgsqft int4 -- Total square footage of the primary building on the parcel.
-        IMPORTANT: use the LIVING / HEATED / MAIN / FINISHED area (labels
-        such as "Living Area", "Heated SF", "Main Area", "Total Living
-        Area", "Finished Area", "Gross Living Area"). Do NOT use "Gross
-        Building Area" or "Gross Area".
+    bldgsqft int4 -- Total square footage of the primary building on the
+        parcel. Use the LIVING / HEATED / MAIN / FINISHED area.
+
+        Acceptable labels (in preference order when more than one is
+        present): "Living Area", "Total Living Area", "Heated SF",
+        "Heated Area", "Finished Area", "Main Area", "Gross Living
+        Area", "Total Square Foot", "Total Area" (when it's the only
+        sqft figure given for the residence — e.g. Spotsylvania County
+        VA cards label the heated area as "Total Area: 1,857 sqft").
+
+        Do NOT use "Gross Building Area", "Gross Area" (when a separate
+        Living/Finished area exists), basement-only sqft, garage sqft,
+        or porch/deck sqft.
     bedrooms int4 -- Number of bedrooms in the primary building on the parcel.
     halfbaths int4 -- Number of half bathrooms in the primary building on the parcel.
     fullbaths int4 -- Number of full bathrooms in the primary building on the parcel.
-    imprvalue int8 -- Improvement value of the parcel.
+    imprvalue int8 -- Improvement value of the parcel — the TOTAL value
+        of ALL improvements (primary building + outbuildings + extra
+        features). Look for labels like "Improvement Value", "Building
+        Value", "Total Improvement Value", "Total Improvement", "Imp
+        Value", "Building & Extra Features", "Building Appraised",
+        "Improvement Appraised", "Improv", "Bldgs+Improv". On Travis
+        County TX cards the improvement value is labeled "Total
+        Improvement" or, in the value-history grid, simply "Improvement"
+        / "Appraised" (the per-year improvement-appraised column).
+
+        CRITICAL: this is for IMPROVEMENTS ONLY (buildings, structures,
+        features) — NEVER the land value. Do not swap with landvalue.
+        It MUST be the parcel-level total improvement value, NOT a
+        single sub-row. Cards often show a per-building or per-feature
+        breakdown (e.g. "DWELL 200,000 / SHED 1,000 / DECK 500")
+        followed by a "Total Improvement Value" row — always pick the
+        total. Never pick a sub-component value when a total exists,
+        and never pick a single building's value on a parcel with
+        multiple buildings. The math invariant landvalue + imprvalue
+        == totalvalue MUST hold; if your candidate violates it, you've
+        picked the wrong row.
 
     landvalue int8 -- Land value of the parcel.
-        IMPORTANT: use the total land value shown in the summary/valuation
-        row (labeled "Land", "Land Value", or "Total Land Value"), NOT a
+        Look for labels like "Land", "Land Value", "Total Land Value",
+        "Total Land", "Land Market", "Land Homesite", "Land Appraised".
+        On Travis County TX cards the land value is labeled "Land
+        Homesite" (residential) or, in the value-history grid, "Land
+        Market" — use that figure (e.g. $250,000), NOT the bigger
+        "Net Appraised" / "Total" figure that combines land+improvement.
+
+        IMPORTANT: this is for LAND ONLY — NEVER the building or
+        improvement value. Do not swap with imprvalue. Use the total
+        land value shown in the summary/valuation row, NOT a
         per-segment base rate or an adjacent column such as "Other",
-        "Build", or "Improvement". If the card shows multiple land segments
-        (e.g. BLDG SITE, OPEN, OPEN SPACE) with individual rates, sum them
-        only if no total is given; otherwise use the total.
+        "Build", or "Improvement". If the card shows multiple land
+        segments (e.g. BLDG SITE, OPEN, OPEN SPACE) with individual
+        rates, sum them only if no total is given; otherwise use the
+        total. The math invariant landvalue + imprvalue == totalvalue
+        MUST hold.
     agvalue int8 -- Agricultural value of the parcel.
-    totalvalue int8 -- Total value of the parcel.
+    totalvalue int8 -- Total assessed/appraised value of the parcel
+        (labels: "Total", "Total Value", "Total Assessed Value",
+        "Grand Total", "Assessed Total").
+
+        The math invariant landvalue + imprvalue == totalvalue MUST
+        hold. Before emitting, verify your three values add up. If they
+        don't, you've picked a sub-row for one of them (most often
+        imprvalue, where a single building's value gets used instead of
+        the parcel total) — find the row that makes the math work.
+
+        When the card shows several years of valuation history (e.g.
+        "01/01/2020", "01/01/2024" rows), use the MOST RECENT year's
+        total. land/impr/total must all come from the SAME assessment
+        year — never mix a current land value with an older total or
+        vice versa.
     taxacres float8 -- Assessed acres of the parcel.
     saleamt int8 -- Amount of the most recent for the parcel. IGNORE older sale records if multiple are present.
     saledate date -- Date of the MOST RECENT sale of the parcel. IGNORE older sale records if multiple are present.
@@ -181,11 +245,25 @@ Field mapping guide:
     heatfuel text -- Fuel used by the PRIMARY HEATING SYSTEM. Allowed values:
         GAS, OIL, ELECTRIC, PROPANE, WOOD, SOLAR, COAL, NONE.
 
-        The value MUST come from a "Heat Fuel", "Heating Fuel", or "Fuel
-        Type" label in the construction-detail / HVAC section. Common
-        abbreviations: "ELECT"/"ELEC" → ELECTRIC, "LP"/"LPG"/"PROPANE" →
-        PROPANE, "Natural Gas"/"N.G."/"GAS" (when labeled as the heat
-        fuel) → GAS, "Fuel Oil"/"OIL" → OIL, "WOOD" → WOOD.
+        The value should come from a "Heat Fuel", "Heating Fuel", or
+        "Fuel Type" label in the construction-detail / HVAC section.
+        Common abbreviations: "ELECT"/"ELEC" → ELECTRIC,
+        "LP"/"LPG"/"PROPANE" → PROPANE, "Natural Gas"/"N.G."/"GAS"
+        (when labeled as the heat fuel) → GAS, "Fuel Oil"/"OIL" → OIL,
+        "WOOD" → WOOD.
+
+        Inferred sources (when no explicit "Heat Fuel" label exists):
+        - "Direct-Vented, Gas" / "Direct-Vent Gas" / "Gas Furnace" /
+          "Gas-Fired Boiler" / "Gas Pack Unit" entries in the
+          construction-detail or building-features list (typical of
+          Spotsylvania County VA cards) describe a gas-fueled primary
+          heating system — emit heatfuel=GAS.
+        - "Heat Pump" entries imply ELECTRIC fuel (heat pumps are
+          electrically driven). Emit heatfuel=ELECTRIC unless the card
+          explicitly says otherwise.
+        - "Oil Furnace" / "Oil Boiler" / "Oil-Fired" entries → OIL.
+        - "Electric Baseboard" / "Electric Furnace" / "Electric Heat" →
+          ELECTRIC.
 
         DO NOT use a fireplace's fuel as heatfuel. "B-FIREPLACE GAS",
         "GAS FIREPLACE", "1-FIREPLACE GAS", or any "FIREPLACE <fuel>"
@@ -486,12 +564,17 @@ def download_pdf(state: AgentState) -> dict:
 # module stays fast and doesn't pull torch into RAM unnecessarily.
 _OCR_MODEL = None
 
-# OCR architecture — sticking with docTR's historical defaults
-# (db_resnet50 + crnn_vgg16_bn). They are fast, well-supported, and on the
-# scaled-up renders the dense table grids parse cleanly without needing a
-# heavier transformer recognition model.
+# OCR architecture — picking the highest-accuracy models docTR ships.
+# Detection: db_resnet50 (top of docTR's published recall/precision on
+# the FUNSD/CORD benchmarks for detection).
+# Recognition: parseq (transformer-based, leads docTR's published word
+# accuracy ~89% vs. ~86% for crnn_vgg16_bn). It's slower and slightly
+# heavier than CRNN but the gain is meaningful on the dense
+# small-glyph table cells found on assessor cards, where a single
+# missed character (e.g. WYTHEVILLE -> WYTHVILLE) can flip a field.
+# Override either via CARD_READER_OCR_DET_ARCH / CARD_READER_OCR_RECO_ARCH.
 _OCR_DET_ARCH = os.getenv("CARD_READER_OCR_DET_ARCH", "db_resnet50")
-_OCR_RECO_ARCH = os.getenv("CARD_READER_OCR_RECO_ARCH", "crnn_vgg16_bn")
+_OCR_RECO_ARCH = os.getenv("CARD_READER_OCR_RECO_ARCH", "parseq")
 
 # pypdfium2 render scale used by DocumentFile.from_pdf. Default 2 (~144 DPI)
 # is too low for the dense table grids on county property cards — adjacent
@@ -553,37 +636,37 @@ def _get_ocr_model():
 # don't suppress OCR.
 _NATIVE_TEXT_MIN_CHARS = 100
 
-# Minimum fraction of non-empty lines that must look "informative"
-# (multi-word, or label/value pair on the same line). Defends against
-# degenerate text layers — e.g. Henry County VA InteractiveGIS cards
-# place label boxes and value boxes as independent text objects, so
-# pymupdf returns a stream of disconnected single-word labels with no
-# values attached. Such text passes the chars threshold but is useless
-# for extraction; we should OCR those pages instead.
-_NATIVE_TEXT_MIN_INFORMATIVE_RATIO = 0.20
+# Minimum fraction of whitespace-split tokens that must contain a digit.
+# Defends against degenerate text layers — e.g. Henry County VA
+# InteractiveGIS cards place label boxes and value boxes as independent
+# text objects, and pymupdf's reader-flow extraction silently drops
+# entire value sections (HVAC, sale price, etc.). The result is text
+# that's almost all label words with very few values. A real
+# assessor-card text layer is dense with numeric tokens (account
+# numbers, dates, $ values, acreage, sqft); the Henry-style degenerate
+# one falls under ~15%. Threshold of 20% cleanly separates the cases
+# observed in fixtures (Henry: 15% degenerate; Wythe: 29% good;
+# Radford: 35-37% good).
+#
+# This check is necessary but not sufficient: a page with a healthy
+# digit-token ratio whose VALUES were also dropped by pymupdf would slip
+# through. So far no fixture exhibits that — degenerate layouts tend to
+# drop both labels and values together.
+_NATIVE_TEXT_MIN_DIGIT_TOKEN_RATIO = 0.20
 
 
 def _is_native_text_useful(text: str) -> bool:
-    """Decide whether a page's native text layer carries enough structure
-    to be used in place of OCR. See ``_NATIVE_TEXT_MIN_CHARS`` and
-    ``_NATIVE_TEXT_MIN_INFORMATIVE_RATIO`` for the thresholds.
+    """Decide whether a page's native text layer carries enough values to
+    be used in place of OCR. See ``_NATIVE_TEXT_MIN_CHARS`` and
+    ``_NATIVE_TEXT_MIN_DIGIT_TOKEN_RATIO`` for the thresholds.
     """
     if len(text) < _NATIVE_TEXT_MIN_CHARS:
         return False
-    lines = [l.strip() for l in text.split("\n") if l.strip()]
-    if not lines:
+    tokens = text.split()
+    if not tokens:
         return False
-    informative = sum(
-        1
-        for l in lines
-        if len(l.split()) >= 3
-        or (
-            len(l.split()) >= 2
-            and re.search(r"[A-Za-z]", l)
-            and re.search(r"\d", l)
-        )
-    )
-    return (informative / len(lines)) >= _NATIVE_TEXT_MIN_INFORMATIVE_RATIO
+    digit_tokens = sum(1 for t in tokens if any(c.isdigit() for c in t))
+    return (digit_tokens / len(tokens)) >= _NATIVE_TEXT_MIN_DIGIT_TOKEN_RATIO
 
 
 def _ocr_page_images(images: list[bytes]) -> list[str]:
@@ -866,11 +949,25 @@ def _run_extraction_llm(source_text: str, context: str | None = None) -> dict:
 
 
 def _reconcile_value_totals(data: dict) -> dict:
-    """Ensure landvalue + imprvalue == totalvalue.
+    """Enforce landvalue + imprvalue == totalvalue.
 
-    If exactly one of the three is missing but the other two are present,
-    compute the missing value arithmetically. If all three are present but
-    inconsistent, log a warning and keep the extracted values as-is.
+    If exactly one of the three is missing but the other two are
+    present, compute the missing value arithmetically.
+
+    If all three are present but inconsistent, attempt to identify and
+    correct the wrong one. The dominant LLM failure mode is picking a
+    sub-row for imprvalue (e.g. a single building's value on a parcel
+    with multiple buildings), producing a small impr that fails the
+    sum check. Heuristics:
+
+    - When ``land + impr < total``: one of land/impr is a sub-row.
+      The smaller component is almost always the mistake — re-derive
+      it from ``total - other``.
+    - When ``land + impr > total``: total is likely from a different
+      (older) assessment year, or one component double-counts an
+      outbuilding. Trust the components and recompute total.
+
+    Both cases log a warning so callers know reconciliation happened.
     """
     land = data.get("landvalue")
     impr = data.get("imprvalue")
@@ -884,24 +981,55 @@ def _reconcile_value_totals(data: dict) -> dict:
     if present == 2:
         if not have_total:
             data["totalvalue"] = land + impr
-            logger.info("Computed missing totalvalue: %d + %d = %d", land, impr, data["totalvalue"])
+            logger.info("Computed missing totalvalue: %d + %d = %d",
+                        land, impr, data["totalvalue"])
         elif not have_impr:
             data["imprvalue"] = total - land
-            logger.info("Computed missing imprvalue: %d - %d = %d", total, land, data["imprvalue"])
+            logger.info("Computed missing imprvalue: %d - %d = %d",
+                        total, land, data["imprvalue"])
         elif not have_land:
             data["landvalue"] = total - impr
-            logger.info("Computed missing landvalue: %d - %d = %d", total, impr, data["landvalue"])
+            logger.info("Computed missing landvalue: %d - %d = %d",
+                        total, impr, data["landvalue"])
         return data
 
     if present < 3:
         return data
 
-    if land + impr != total:
+    if land + impr == total:
+        return data
+
+    if land + impr < total:
+        # One component is a sub-row. The smaller of the two is the
+        # mistake — re-derive from total minus the trusted (larger) one.
+        if impr <= land:
+            new_impr = total - land
+            logger.warning(
+                "Value mismatch: land=%d + impr=%d = %d != total=%d; "
+                "imprvalue (%d) looks like a sub-row, recomputing as %d",
+                land, impr, land + impr, total, impr, new_impr,
+            )
+            data["imprvalue"] = new_impr
+        else:
+            new_land = total - impr
+            logger.warning(
+                "Value mismatch: land=%d + impr=%d = %d != total=%d; "
+                "landvalue (%d) looks like a sub-row, recomputing as %d",
+                land, impr, land + impr, total, land, new_land,
+            )
+            data["landvalue"] = new_land
+    else:
+        # land + impr overshoots total — total is likely stale (wrong
+        # assessment year) or land/impr double-counts. Recompute total
+        # from the components, which usually come from the current year.
+        new_total = land + impr
         logger.warning(
-            "Value totals inconsistent: land=%d + impr=%d = %d != total=%d; "
-            "keeping extracted values",
-            land, impr, land + impr, total,
+            "Value mismatch: land=%d + impr=%d = %d > total=%d; "
+            "totalvalue likely from an older year, recomputing as %d",
+            land, impr, land + impr, total, new_total,
         )
+        data["totalvalue"] = new_total
+
     return data
 
 
@@ -1145,11 +1273,13 @@ _FIELD_RETRY_HINTS: dict[str, tuple[re.Pattern, str]] = {
     "bldgsqft": (
         re.compile(
             r"\b(?:living\s*area|heated\s*s(?:f|q\.?\s*ft)|finished\s*area|"
-            r"total\s*living(?:\s*area)?|main\s*area|total\s*square\s*foot)\b",
+            r"total\s*living(?:\s*area)?|main\s*area|total\s*square\s*foot|"
+            r"total\s*area)\b",
             re.IGNORECASE,
         ),
-        "Living / heated / finished area square footage (integer). NOT gross "
-        "building area.",
+        "Living / heated / finished / main area square footage (integer). "
+        "On Spotsylvania-style cards 'Total Area' is the heated area — use "
+        "it when no Living/Finished label is present. NOT gross building area.",
     ),
     "bedrooms": (
         re.compile(
@@ -1252,7 +1382,11 @@ _FIELD_RETRY_HINTS: dict[str, tuple[re.Pattern, str]] = {
     ),
     "zoningcode": (
         re.compile(r"\bzoning(?:\s*code)?\b", re.IGNORECASE),
-        "Zoning code (short alphanumeric, e.g. 'SR', 'R-1', 'A1').",
+        "Zoning code (alphanumeric, typically letter prefix + numeric "
+        "or dashed suffix: e.g. 'SR', 'R-1', 'A1', 'SF-2', 'PUL_R4'). "
+        "Prefer the longer, more specific code when several candidates "
+        "appear — a bare single letter like 'R' is usually a property-"
+        "type abbreviation, not the full zoning code.",
     ),
 }
 
@@ -1408,6 +1542,44 @@ def _retry_missing_labeled_fields(data: dict, text: str) -> dict:
     return data
 
 
+def _infer_heating_from_central_air(data: dict, text: str) -> dict:
+    """Infer heating from cooling on cards where the only HVAC indicator
+    is a "Central Air" signal alongside a heat-fuel label.
+
+    Common on Henry County VA InteractiveGIS cards: the card lists
+    "Heat Fuel: ELECT" + "Central Air % 100" with no explicit
+    heating-delivery cell. The building has one central forced-air HVAC
+    system that does both heating and cooling, so heating mirrors
+    cooling in this layout.
+
+    Conditions to fire:
+      - heating is empty/missing
+      - cooling resolves to a CENTRAL value (CENTRAL / CENTRAL AIR)
+      - the OCR/native text actually contains a "Central Air" or
+        "Central A/C" token (don't trust a cooling value the LLM might
+        have invented out of nowhere)
+    """
+    if data.get("heating"):
+        return data
+
+    cooling = data.get("cooling")
+    if not isinstance(cooling, str):
+        return data
+    cooling_upper = cooling.strip().upper()
+    if "CENTRAL" not in cooling_upper:
+        return data
+
+    if not re.search(r"\bcentral\s*(?:air|a\s*/?\s*c)\b", text, re.IGNORECASE):
+        return data
+
+    data["heating"] = cooling_upper
+    logger.info(
+        "Inferred heating=%r from cooling + 'Central Air' signal in source text",
+        cooling_upper,
+    )
+    return data
+
+
 def _drop_unverified_none(data: dict, text: str) -> dict:
     """Strip "NONE" string values that the OCR text doesn't actually contain.
 
@@ -1451,6 +1623,7 @@ def extract_data(state: AgentState) -> dict:
     data = _retry_parcelid(data, text)
     data = _post_extract_heatfuel(data, text)
     data = _retry_missing_labeled_fields(data, text)
+    data = _infer_heating_from_central_air(data, text)
     data = _drop_unverified_none(data, text)
     logger.info("Extracted %d fields from PDF text", len(data))
     return {"property_data": data}

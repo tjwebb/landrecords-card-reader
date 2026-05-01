@@ -105,11 +105,11 @@ class TestSpotsylvania0PV:
 
     def test_landvalue(self, pv_result):
         data, _ = pv_result
-        assert data.get("landvalue") == 157200, f"landvalue: got {data.get('landvalue')!r}"
+        assert data.get("landvalue") == 172200, f"landvalue: got {data.get('landvalue')!r}"
 
     def test_totalvalue(self, pv_result):
         data, _ = pv_result
-        assert data.get("totalvalue") == 371900, f"totalvalue: got {data.get('totalvalue')!r}"
+        assert data.get("totalvalue") == 382200, f"totalvalue: got {data.get('totalvalue')!r}"
 
     def test_value_consistency(self, pv_result):
         data, _ = pv_result
