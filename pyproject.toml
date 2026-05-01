@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "landrecords-card-reader"
-version = "0.3.4"
+version = "0.3.5"
 description = "Extract structured property data from assessment card PDFs using LLM-powered text extraction"
 readme = "README.md"
 license = "MIT"
@@ -59,6 +59,12 @@ packages = ["landrecords_card_reader", "landrecords_card_reader.tests"]
 [tool.setuptools.package-dir]
 "landrecords_card_reader" = "src"
 "landrecords_card_reader.tests" = "src/tests"
+
+# Bundle pre-downloaded docTR weights so the wheel doesn't need network
+# access on first OCR call. Run `prefetch_doctr_models()` (or publish.sh)
+# before `python -m build` to populate src/doctr_cache/models/*.pt.
+[tool.setuptools.package-data]
+"landrecords_card_reader" = ["doctr_cache/models/*.pt"]
 
 [tool.pytest.ini_options]
 log_cli = true

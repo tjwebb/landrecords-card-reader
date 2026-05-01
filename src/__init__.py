@@ -34,12 +34,25 @@ def warm_ocr_cache() -> None:
       - You want to fail fast on first deploy if model weights can't be
         fetched (e.g. behind a strict egress firewall).
 
-    The model is cached in ``$DOCTR_CACHE_DIR`` (default ``~/.cache/doctr/``).
-    Set ``DOCTR_CACHE_DIR`` to a persistent / shared path before calling
-    this so multiple workers can share the same downloaded weights.
+    Resolution order for weights:
+      1. ``$DOCTR_CACHE_DIR`` if explicitly set
+      2. The package-bundled cache (``<install>/doctr_cache``) when the
+         wheel was built with ``prefetch_doctr_models()``
+      3. ``~/.cache/doctr/`` (docTR's default; downloads on first use)
     """
     from .nodes import _get_ocr_model
     _get_ocr_model()
+
+
+def prefetch_doctr_models() -> None:
+    """Download docTR OCR weights into the package-bundled cache.
+
+    Intended as a build-time step: run once on the publisher's machine
+    before ``python -m build`` so the wheel ships with the weights and
+    end users don't pay first-call download latency. Idempotent.
+    """
+    from .nodes import prefetch_doctr_models as _prefetch
+    _prefetch()
 
 
 def read_property_card(

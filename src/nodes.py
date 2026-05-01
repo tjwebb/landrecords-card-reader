@@ -149,9 +149,26 @@ Field mapping guide:
     totalrooms int4 -- Total number of rooms in the primary building on the parcel.
     fireplaces int4 -- Number of fireplaces in the primary building on the parcel.
     heating text -- Type of heating system in the primary building on the parcel
-        (e.g. FORCED AIR, HEAT PUMP, BASEBOARD, RADIANT, WARMED & COOLED AIR).
-        This describes the delivery/system type, NOT the fuel.
-        Sometimes labeled as "HVAC".
+        (e.g. FORCED AIR, HEAT PUMP, BASEBOARD, RADIANT, CENTRAL,
+        WARMED & COOLED AIR). This describes the delivery/system type, NOT
+        the fuel.
+
+        The label varies widely across counties. Treat ANY of these as the
+        heating-system label, not just the word "Heating": "HEAT", "HEATING",
+        "HEAT TYPE", "HEATING TYPE", "HEATING SYSTEM", "HEAT SYSTEM",
+        "HVAC", "HVAC SYSTEM", "HEAT/AC", "H/AC", "H/A". A bare "HEAT"
+        column header on a construction-detail row IS the heating label —
+        do not skip it just because the word "heating" is absent.
+
+        Expand common abbreviations to their full canonical form:
+        "CTRL"/"CENT"/"CNTL" -> CENTRAL, "FA"/"F/A" -> FORCED AIR,
+        "HP"/"H/P" -> HEAT PUMP, "BB"/"BSBD" -> BASEBOARD,
+        "RAD" -> RADIANT, "GFA" -> FORCED AIR (gas-forced-air system).
+        If the value cell shows e.g. "HEAT CTRL", emit heating="CENTRAL".
+
+        Do NOT confuse a fireplace appliance row ("FIREPLACE", "B-FIREPLACE
+        GAS", "1-FIREPLACE") with the heating system. Those are features in
+        the outbuildings/extras list, not the primary heating delivery.
 
     heatfuel text -- Fuel used by the PRIMARY HEATING SYSTEM. Allowed values:
         GAS, OIL, ELECTRIC, PROPANE, WOOD, SOLAR, COAL, NONE.
@@ -172,7 +189,31 @@ Field mapping guide:
         heatfuel to GAS — use whatever the "Heat Fuel" label says (often
         ELECTRIC), or omit the field entirely.
 
-    cooling text -- Type of cooling system in the primary building on the parcel.  Sometimes labeled as "HVAC".
+    cooling text -- Type of cooling system in the primary building on the
+        parcel. Allowed values: CENTRAL AIR, HEAT PUMP, WINDOW UNIT,
+        EVAPORATIVE, NONE.
+
+        Many cards do NOT spell out the cooling type — they just record
+        whether AC is present, often as a square-footage row. Treat ANY of
+        these signals as cooling=CENTRAL AIR (unless an explicit type is
+        given): an "Air Cond", "AC", "A/C", "Central Air", or "Cooling"
+        row showing nonzero sqft / area; an "Air Condition" / "AC" line
+        with a nonzero dollar value in the improvement summary; a "% AC"
+        or "AC %" value greater than 0. The presence of nonzero AC area
+        means the building has central AC — emit cooling=CENTRAL AIR.
+
+        Special case: if the primary heating system is a HEAT PUMP and the
+        card also indicates AC is present (any of the signals above),
+        emit cooling=HEAT PUMP — the same unit provides both heating and
+        cooling.
+
+        Only emit cooling=NONE if the card EXPLICITLY says so (e.g. the
+        "Air Cond" row is all zeros AND a label like "Cooling: None"
+        appears, or the literal text "NONE" is the value next to a cooling
+        label). If the card is silent on cooling, OMIT the field — do not
+        guess.
+
+        Sometimes labeled as "HVAC".
     foundation text -- Type of foundation of the primary building on the parcel.
     attic text -- Type of attic in the primary building on the parcel.
     atticsqft int4 -- Square footage of the attic in the primary building on the parcel.
@@ -430,10 +471,12 @@ def download_pdf(state: AgentState) -> dict:
     return {"pdf_content": content}
 
 
-# Cached docTR predictor. Model weights (~100MB+) are downloaded to
-# ~/.cache/doctr/ on first call and re-used for subsequent OCR runs in the
-# same process. Loading is deferred until first use so importing this
-# module stays fast and doesn't pull torch into RAM unnecessarily.
+# Cached docTR predictor. Model weights (~100MB+) are loaded from the
+# package-bundled cache when present (see _activate_bundled_doctr_cache),
+# otherwise downloaded to ~/.cache/doctr/ on first call. Cached predictor
+# is re-used for subsequent OCR runs in the same process. Loading is
+# deferred until first use so importing this module stays fast and doesn't
+# pull torch into RAM unnecessarily.
 _OCR_MODEL = None
 
 # OCR architecture — sticking with docTR's historical defaults
@@ -442,6 +485,67 @@ _OCR_MODEL = None
 # heavier transformer recognition model.
 _OCR_DET_ARCH = os.getenv("CARD_READER_OCR_DET_ARCH", "db_resnet50")
 _OCR_RECO_ARCH = os.getenv("CARD_READER_OCR_RECO_ARCH", "crnn_vgg16_bn")
+
+# Package-bundled docTR cache. When the wheel ships with weights pre-placed
+# under <package>/doctr_cache/models/, point DOCTR_CACHE_DIR there so docTR
+# uses them instead of fetching from doctr-static.mindee.com on first call.
+# The expected file names match what docTR's ``download_from_url`` derives
+# from the URLs in default_cfgs (the trailing ``-<hash>.pt`` segment).
+_BUNDLED_DOCTR_DIR = os.path.join(os.path.dirname(__file__), "doctr_cache")
+_BUNDLED_MODEL_FILES = {
+    "db_resnet50": "db_resnet50-79bd7d70.pt",
+    "crnn_vgg16_bn": "crnn_vgg16_bn-0417f351.pt",
+}
+
+
+def _activate_bundled_doctr_cache() -> bool:
+    """Point DOCTR_CACHE_DIR at the package-bundled cache when complete.
+
+    Returns True if the bundled cache was activated (or was already in
+    use), False if the bundle is missing files and we fell through to
+    docTR's default behavior. A user-set DOCTR_CACHE_DIR is always
+    honored — we only set it when unset.
+    """
+    if os.environ.get("DOCTR_CACHE_DIR"):
+        return False
+
+    needed = [_BUNDLED_MODEL_FILES[a] for a in (_OCR_DET_ARCH, _OCR_RECO_ARCH)
+              if a in _BUNDLED_MODEL_FILES]
+    if not needed:
+        return False
+
+    models_dir = os.path.join(_BUNDLED_DOCTR_DIR, "models")
+    if not all(os.path.isfile(os.path.join(models_dir, fn)) for fn in needed):
+        return False
+
+    os.environ["DOCTR_CACHE_DIR"] = _BUNDLED_DOCTR_DIR
+    logger.info("Using bundled docTR weights from %s", _BUNDLED_DOCTR_DIR)
+    return True
+
+
+def prefetch_doctr_models() -> None:
+    """Download docTR weights into the package-bundled cache directory.
+
+    Intended as a build-time step (run once before ``python -m build`` so
+    the wheel ships with the weights). The download is a no-op when the
+    expected files are already present and pass the hash check that
+    docTR's downloader performs internally.
+    """
+    os.environ["DOCTR_CACHE_DIR"] = _BUNDLED_DOCTR_DIR
+    os.makedirs(os.path.join(_BUNDLED_DOCTR_DIR, "models"), exist_ok=True)
+
+    from doctr.models import ocr_predictor
+
+    logger.info(
+        "Prefetching docTR weights into %s (det=%s, reco=%s)",
+        _BUNDLED_DOCTR_DIR, _OCR_DET_ARCH, _OCR_RECO_ARCH,
+    )
+    ocr_predictor(
+        det_arch=_OCR_DET_ARCH,
+        reco_arch=_OCR_RECO_ARCH,
+        pretrained=True,
+        assume_straight_pages=True,
+    )
 
 # pypdfium2 render scale used by DocumentFile.from_pdf. Default 2 (~144 DPI)
 # is too low for the dense table grids on county property cards — adjacent
@@ -463,6 +567,7 @@ def _get_ocr_model():
     """
     global _OCR_MODEL
     if _OCR_MODEL is None:
+        _activate_bundled_doctr_cache()
         from doctr.models import ocr_predictor
         try:
             import torch

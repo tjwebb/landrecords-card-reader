@@ -10,3 +10,7 @@ build/
 .pytest_cache/
 .env
 landrecords_card_reader/tests/extracted_images/
+
+# Pre-downloaded docTR weights — bundled into the wheel by publish.sh
+# but kept out of git (large binaries, easy to refetch).
+src/doctr_cache/models/*.pt

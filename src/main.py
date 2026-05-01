@@ -10,9 +10,12 @@ from .nodes import download_pdf, extract_data, extract_pdf_and_photos
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Extract property data from a property card PDF."
+        description="Extract property data from a property card PDF or HTML page.",
     )
-    parser.add_argument("url", help="URL to a property card PDF")
+    parser.add_argument(
+        "url",
+        help="URL to a property card PDF or HTML page (HTML is converted to PDF via wkhtmltopdf)",
+    )
     parser.add_argument(
         "-v", "--verbose",
         action="store_true",
