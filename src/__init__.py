@@ -124,9 +124,14 @@ def read_property_card_from_url(
     """
     import httpx
 
-    from .nodes import _html_to_pdf, _is_pdf
+    from .nodes import _BROWSER_UA, _html_to_pdf, _is_pdf
 
-    with httpx.Client(timeout=60, follow_redirects=True, verify=False) as client:
+    with httpx.Client(
+        timeout=60,
+        follow_redirects=True,
+        verify=False,
+        headers={"user-agent": _BROWSER_UA},
+    ) as client:
         resp = client.get(url)
         resp.raise_for_status()
     content = resp.content

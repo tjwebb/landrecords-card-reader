@@ -17,12 +17,30 @@ try:
 except ImportError:
     pass
 
+# matplotlib (pulled in transitively via docTR's visualization helpers)
+# scans system fonts at import time and emits INFO-level noise like
+# "Failed to extract font properties from /usr/share/fonts/.../NotoColorEmoji.ttf"
+# whenever it encounters a font it can't parse. These are harmless on
+# Linux hosts that ship emoji/unifont packages, but spam every worker
+# process. Pin the font_manager logger to WARNING so they're hidden but
+# real font errors still surface.
+logging.getLogger("matplotlib.font_manager").setLevel(logging.WARNING)
+
 from .config import (
     CARD_READER_EXTRACTION_MODEL,
     CARD_READER_OLLAMA_HOST,
     CARD_READER_PHOTO_CLASSIFICATION_MODEL,
 )
 from .state import AgentState
+
+# Several assessor sites (e.g. propertysearch.arlingtonva.us) reject the
+# default ``python-httpx/X.Y.Z`` UA with HTTP 403. Send a plausible
+# browser UA instead — almost no site filters this and we don't want
+# the pipeline to fail on basic anti-bot heuristics.
+_BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,8 +83,8 @@ Field mapping guide:
         "Parcel ID", "APN", "PIN", "PID", "GPIN", "Parcel #", "Map ID").
         Usually contains 4-12 characters, sometimes with dashes or spaces.
     parcelid2 text -- Secondary identifier for the parcel, if available. e.g. lrsn, alternate_pid.
-    taxacctnum text -- Tax account number associated with the parcel, e.g. tax_id, taxacctnum.
-    taxyear int4 -- The tax year for which the data is relevant, e.g. 2025.
+    taxacctnum text -- Tax account number associated with the parcel, e.g. tax_id, taxacctnum. Usually numeric.
+    taxyear int4 -- The tax year for which the data is relevant, e.g. 2026.
     usecode text -- The land use code assigned to the parcel.
     usedesc text -- A description of the land use associated with the parcel.
 
@@ -164,13 +182,13 @@ Field mapping guide:
         vice versa.
     taxacres float8 -- Assessed acres of the parcel.
     saleamt int8 -- Amount of the most recent for the parcel. IGNORE older sale records if multiple are present.
-    saledate date -- Date of the MOST RECENT sale of the parcel. IGNORE older sale records if multiple are present.
+    saledate date -- Date of the most recent sale of the parcel. IGNORE older sale records if multiple are present.
     ownername text -- Name of the parcel owner.
     owneraddr text -- Address of the parcel owner.
     ownercity text -- City of the parcel owner.
     ownerstate text -- State of the parcel owner.
 
-    ownerzip text -- ZIP code of the parcel owner.
+    ownerzip text -- ZIP code or postal code of the parcel owner.
     parceladdr text -- Address of the parcel.
         IMPORTANT: this is the PHYSICAL LOCATION of the property itself
         (labels like "Property Location", "Location", "Situs Address",
@@ -300,6 +318,7 @@ Field mapping guide:
         guess.
 
         Sometimes labeled as "HVAC".
+
     foundation text -- Type of foundation of the primary building on the parcel.
     attic text -- Type of attic in the primary building on the parcel.
     atticsqft int4 -- Square footage of the attic in the primary building on the parcel.
@@ -344,7 +363,7 @@ Field mapping guide:
     shed bool -- Indicates presence of a shed on the parcel.
     workshop bool -- Indicates presence of a workshop on the parcel.
 
-    taxdistrict text -- Name of the tax district
+    taxdistrict text -- Name of the tax district.
 );
 
 Rules:
@@ -547,7 +566,12 @@ def download_pdf(state: AgentState) -> dict:
     else:
         url = state["pdf_url"]
         logger.info("Downloading PDF from %s", url)
-        with httpx.Client(timeout=60, follow_redirects=True, verify=False) as client:
+        with httpx.Client(
+            timeout=60,
+            follow_redirects=True,
+            verify=False,
+            headers={"user-agent": _BROWSER_UA},
+        ) as client:
             resp = client.get(url)
             resp.raise_for_status()
         content = resp.content
@@ -692,6 +716,34 @@ def _ocr_page_images(images: list[bytes]) -> list[str]:
     return out
 
 
+def _render_pages_with_pdfium(content: bytes, page_indices: list[int]) -> list[bytes]:
+    """Render specific PDF pages to PNG bytes via pypdfium2.
+
+    Used in place of pymupdf's get_pixmap for the OCR-fallback path —
+    we hit a reproducible SIGSEGV in mupdf's display-list rendering on
+    some Linux hosts when given wkhtmltopdf-generated PDFs (the
+    Arlington County HTML→PDF flow). pypdfium2 is the same renderer
+    docTR uses for ``DocumentFile.from_pdf`` and is much more
+    battle-tested across platforms; it's already a transitive
+    dependency via doctr.
+    """
+    import io
+
+    import pypdfium2 as pdfium
+
+    pdf = pdfium.PdfDocument(content)
+    images: list[bytes] = []
+    try:
+        for i in page_indices:
+            pil_image = pdf[i].render(scale=_OCR_RENDER_SCALE).to_pil()
+            buf = io.BytesIO()
+            pil_image.save(buf, format="PNG")
+            images.append(buf.getvalue())
+    finally:
+        pdf.close()
+    return images
+
+
 def _ocr_pdf(content: bytes) -> str:
     """Extract per-page text from the PDF, using OCR only where required.
 
@@ -702,9 +754,15 @@ def _ocr_pdf(content: bytes) -> str:
 
     Pages without a usable text layer (typical of scanned cards or pages
     where the text is baked into a raster image) are rendered to PNG at
-    ``CARD_READER_OCR_RENDER_SCALE`` (~288 DPI by default) and run through
-    docTR (db_resnet50 + crnn_vgg16_bn defaults). Only those pages pay the
-    OCR cost; pages with a native text layer skip the model entirely.
+    ``CARD_READER_OCR_RENDER_SCALE`` (~288 DPI by default) via
+    pypdfium2 and run through docTR. Only those pages pay the OCR cost;
+    pages with a native text layer skip the model entirely.
+
+    Why pypdfium2 for rendering when pymupdf is already open: pymupdf's
+    mupdf backend has segfaulted reproducibly on wkhtmltopdf-generated
+    PDFs in certain Linux environments. pypdfium2 (Chromium's PDFium)
+    handles those PDFs cleanly and is the same renderer docTR uses
+    natively, so output quality is identical.
 
     Returned text follows original page order, with ``=== Page N ===``
     headers when the document has more than one populated page.
@@ -714,10 +772,8 @@ def _ocr_pdf(content: bytes) -> str:
     doc = fitz.open(stream=content, filetype="pdf")
     page_texts: list[str | None] = []
     pages_needing_ocr: list[int] = []
-    rendered_images: list[bytes] = []
 
     try:
-        dpi = int(72 * _OCR_RENDER_SCALE)
         for i in range(len(doc)):
             native = (doc[i].get_text() or "").strip()
             if _is_native_text_useful(native):
@@ -725,9 +781,14 @@ def _ocr_pdf(content: bytes) -> str:
             else:
                 page_texts.append(None)
                 pages_needing_ocr.append(i)
-                rendered_images.append(doc[i].get_pixmap(dpi=dpi).tobytes("png"))
     finally:
         doc.close()
+
+    rendered_images: list[bytes] = (
+        _render_pages_with_pdfium(content, pages_needing_ocr)
+        if pages_needing_ocr
+        else []
+    )
 
     native_count = len(page_texts) - len(pages_needing_ocr)
     if pages_needing_ocr:
@@ -890,18 +951,14 @@ def extract_property_photos(state: AgentState) -> dict:
                         "ext": extracted.get("ext", "bin"),
                         "bytes": extracted["image"],
                     })
-                else:
-                    bbox = info.get("bbox")
-                    if not bbox:
-                        continue
-                    pix = page.get_pixmap(clip=fitz.Rect(bbox), dpi=CLIP_DPI)
-                    candidates.append({
-                        "page": page_num + 1,
-                        "width": pix.width,
-                        "height": pix.height,
-                        "ext": "jpeg",
-                        "bytes": pix.tobytes("jpeg"),
-                    })
+                # Inline images (xref == 0) would need page rasterization
+                # via page.get_pixmap — that path has segfaulted in mupdf
+                # on wkhtmltopdf-generated PDFs in certain Linux
+                # environments. Skip them: in practice property-card
+                # photos are virtually always embedded with xrefs (the
+                # path above), and HTML→PDF cards rarely have property
+                # photos at all. Better to miss a rare inline image than
+                # crash the worker.
     finally:
         doc.close()
 
