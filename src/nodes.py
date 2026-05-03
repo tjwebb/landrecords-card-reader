@@ -1001,7 +1001,24 @@ def extract_property_photos(state: AgentState) -> dict:
 
     logger.info("Found %d candidate image(s), classifying with vision model", len(candidates))
 
-    photos = [c for c in candidates if _is_property_photo(c["bytes"])]
+    # Classify candidates in parallel — each call is a single Ollama HTTP
+    # round-trip, which is I/O bound. Up to PHOTO_CLASSIFY_CONCURRENCY
+    # requests overlap; Ollama serializes GPU work internally so this
+    # doesn't help inference time, but it does eliminate the per-request
+    # network/scheduling overhead between candidates. Order is preserved
+    # via map() so the survivors line up with the original candidate
+    # list.
+    if candidates:
+        from concurrent.futures import ThreadPoolExecutor
+
+        PHOTO_CLASSIFY_CONCURRENCY = min(8, len(candidates))
+        with ThreadPoolExecutor(max_workers=PHOTO_CLASSIFY_CONCURRENCY) as pool:
+            verdicts = list(pool.map(
+                _is_property_photo, (c["bytes"] for c in candidates),
+            ))
+        photos = [c for c, keep in zip(candidates, verdicts) if keep]
+    else:
+        photos = []
 
     logger.info("Kept %d/%d image(s) as property photos", len(photos), len(candidates))
     return {"property_photos": photos}
