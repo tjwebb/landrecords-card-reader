@@ -716,16 +716,14 @@ def _ocr_page_images(images: list[bytes]) -> list[str]:
     return out
 
 
-def _render_pages_with_pdfium(content: bytes, page_indices: list[int]) -> list[bytes]:
-    """Render specific PDF pages to PNG bytes via pypdfium2.
+def _pdfium_render_worker(
+    content: bytes, page_indices: list[int], scale: float
+) -> list[bytes]:
+    """Subprocess entry point: render PDF pages to PNG bytes via pypdfium2.
 
-    Used in place of pymupdf's get_pixmap for the OCR-fallback path —
-    we hit a reproducible SIGSEGV in mupdf's display-list rendering on
-    some Linux hosts when given wkhtmltopdf-generated PDFs (the
-    Arlington County HTML→PDF flow). pypdfium2 is the same renderer
-    docTR uses for ``DocumentFile.from_pdf`` and is much more
-    battle-tested across platforms; it's already a transitive
-    dependency via doctr.
+    Defined at module level so ``multiprocessing`` (spawn context) can
+    pickle and import it in the child interpreter. Caller is
+    :func:`_render_pages_with_pdfium`; do not invoke directly.
     """
     import io
 
@@ -735,13 +733,52 @@ def _render_pages_with_pdfium(content: bytes, page_indices: list[int]) -> list[b
     images: list[bytes] = []
     try:
         for i in page_indices:
-            pil_image = pdf[i].render(scale=_OCR_RENDER_SCALE).to_pil()
+            pil_image = pdf[i].render(scale=scale).to_pil()
             buf = io.BytesIO()
             pil_image.save(buf, format="PNG")
             images.append(buf.getvalue())
     finally:
         pdf.close()
     return images
+
+
+def _render_pages_with_pdfium(content: bytes, page_indices: list[int]) -> list[bytes]:
+    """Render specific PDF pages to PNG bytes in an isolated subprocess.
+
+    Two reasons rendering runs out-of-process:
+
+    1. **Thread safety.** PDFium's C API is not thread-safe, and the
+       pipeline runs ``_ocr_pdf`` and ``extract_property_photos``
+       concurrently from a ThreadPoolExecutor — concurrent in-process
+       PDFium calls can race and corrupt internal state. A fresh
+       subprocess is the only PDFium caller in its interpreter, so
+       there's nothing to race with.
+
+    2. **Segfault containment.** mupdf (pymupdf's backend) and
+       occasionally PDFium itself have segfaulted on wkhtmltopdf-
+       generated PDFs in certain Linux environments. A SIGSEGV in
+       Python C code is fatal to the whole process — but in a
+       subprocess it's fatal only to the subprocess, and the parent
+       gets a clean ``BrokenProcessPool`` / ``Process`` exit code we
+       can surface as a normal Python exception.
+
+    ``multiprocessing.get_context("spawn")`` is used (not the default
+    ``fork`` on Linux) so the child inherits no copy-on-write state
+    from the parent — this avoids the well-known fork-after-threads
+    deadlocks docTR/PyTorch can trigger.
+    """
+    if not page_indices:
+        return []
+
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor
+
+    ctx = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as pool:
+        future = pool.submit(
+            _pdfium_render_worker, content, page_indices, _OCR_RENDER_SCALE,
+        )
+        return future.result()
 
 
 def _ocr_pdf(content: bytes) -> str:
