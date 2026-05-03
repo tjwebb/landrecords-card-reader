@@ -400,6 +400,7 @@ def _stream_llm(messages: list[dict], *, label: str = "extraction") -> str:
         "messages": messages,
         "stream": True,
         "think": False,
+        "num_keep": 0,
     }
 
     if stream_to_console:
@@ -550,6 +551,14 @@ def _html_to_pdf(html: bytes, url: str) -> bytes:
         "load-error-handling": "ignore",
         "load-media-error-handling": "ignore",
         "quiet": "",
+        # JavaScript on assessor sites tends to HIDE content rather than
+        # add it: jQuery UI tabs collapse extra panels (Stafford County
+        # VA's "Floor Areas" / "Exterior Features" tabs), inline-style
+        # injectors set display:none on detail rows, etc. Property data
+        # is universally server-rendered into the initial HTML, so
+        # disabling JS reliably exposes more content and never hides
+        # any. Also speeds up conversion (no javascript-delay wait).
+        "disable-javascript": "",
     }
     return pdfkit.from_string(html_str, False, options=options)
 
@@ -620,22 +629,42 @@ _OCR_RECO_ARCH = os.getenv("CARD_READER_OCR_RECO_ARCH", "parseq")
 _OCR_RENDER_SCALE = float(os.getenv("CARD_READER_OCR_RENDER_SCALE", "4"))
 
 
+def _doctr_cache_dir() -> str:
+    """Return the docTR weights cache directory (creating it if missing)."""
+    cache_dir = os.environ.get(
+        "DOCTR_CACHE_DIR", os.path.join(os.path.expanduser("~"), ".cache", "doctr"),
+    )
+    os.makedirs(cache_dir, exist_ok=True)
+    return cache_dir
+
+
 def _get_ocr_model():
-    """Return the lazy-loaded docTR OCR predictor (thread-safe singleton).
+    """Return the lazy-loaded docTR OCR predictor (thread- and process-safe).
 
-    Uses double-checked locking so the steady-state fast path is
-    lock-free: callers only acquire ``_OCR_MODEL_LOCK`` until the first
-    initialisation completes, after which every subsequent call just
-    reads the already-populated ``_OCR_MODEL`` and returns. The lock
-    matters because docTR's first-call download writes weights to
-    ``~/.cache/doctr/`` non-atomically — concurrent first-call threads
-    will both invoke the downloader and corrupt the file.
+    Layered locking:
 
-    Built with ``assume_straight_pages=True`` to skip the rotation-correction
-    pass — county cards are always upright, so paying for skew estimation
-    on every page is pure overhead. The predictor is moved to CUDA when
-    available; PyTorch falls back to CPU silently if the runtime has no
-    CUDA build or no usable GPU.
+    * **Process-local** ``_OCR_MODEL_LOCK`` (a ``threading.Lock``) makes
+      the in-process initialiser idempotent. Without it, N threads
+      calling this concurrently would all see ``_OCR_MODEL is None`` and
+      all enter the load path.
+
+    * **Cross-process** advisory file lock (``fcntl.flock`` on a
+      sentinel inside the docTR cache dir) makes the initial weight
+      download safe across separate Python processes that share a
+      filesystem — typical in Ray clusters where N workers in the same
+      cluster, all importing this module concurrently, would otherwise
+      all call docTR's downloader, all write to the same .pt path, and
+      all corrupt each other (manifests as: "corrupted download, the
+      hash of ... does not match"). The first process acquires the
+      lock, downloads, releases. The next process acquires, finds the
+      file already on disk, and docTR's internal hash check makes its
+      download a no-op.
+
+    Built with ``assume_straight_pages=True`` to skip the rotation-
+    correction pass — county cards are always upright, so paying for
+    skew estimation on every page is pure overhead. The predictor is
+    moved to CUDA when available; PyTorch falls back to CPU silently if
+    the runtime has no CUDA build or no usable GPU.
     """
     global _OCR_MODEL
     # Fast path: model already loaded, no lock needed.
@@ -643,40 +672,67 @@ def _get_ocr_model():
         return _OCR_MODEL
 
     with _OCR_MODEL_LOCK:
-        # Re-check under the lock — another thread may have finished
-        # loading while we were blocked acquiring it.
+        # Re-check under the in-process lock — another thread may have
+        # finished loading while we were blocked acquiring it.
         if _OCR_MODEL is not None:
             return _OCR_MODEL
 
-        from doctr.models import ocr_predictor
+        # Cross-process file lock around the download. Best-effort:
+        # fcntl is Unix-only, so on Windows we skip the file lock (the
+        # in-process lock above is still active). Lock is held for the
+        # full ocr_predictor() call so docTR sees a stable filesystem
+        # while it's verifying / downloading weights.
+        cache_dir = _doctr_cache_dir()
+        lock_path = os.path.join(cache_dir, ".pcr-loader.lock")
+        lock_handle = None
         try:
-            import torch
-            use_cuda = torch.cuda.is_available()
-        except ImportError:
-            use_cuda = False
+            import fcntl
+            lock_handle = open(lock_path, "w")
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        except (ImportError, OSError) as e:
+            logger.debug("fcntl file lock unavailable (%s); using in-process lock only", e)
+            if lock_handle is not None:
+                lock_handle.close()
+                lock_handle = None
 
-        device_label = "GPU/CUDA" if use_cuda else "CPU"
-        logger.info(
-            "Loading docTR OCR model on %s (det=%s, reco=%s) "
-            "(first call: weight download + init)",
-            device_label, _OCR_DET_ARCH, _OCR_RECO_ARCH,
-        )
-        model = ocr_predictor(
-            det_arch=_OCR_DET_ARCH,
-            reco_arch=_OCR_RECO_ARCH,
-            pretrained=True,
-            assume_straight_pages=True,
-        )
-        if use_cuda:
+        try:
+            from doctr.models import ocr_predictor
             try:
-                model = model.cuda()
-                logger.info("docTR predictor moved to CUDA")
-            except Exception as e:
-                logger.warning(
-                    "Failed to move docTR predictor to CUDA (%s); staying on CPU", e,
-                )
-        _OCR_MODEL = model
-        return _OCR_MODEL
+                import torch
+                use_cuda = torch.cuda.is_available()
+            except ImportError:
+                use_cuda = False
+
+            device_label = "GPU/CUDA" if use_cuda else "CPU"
+            logger.info(
+                "Loading docTR OCR model on %s (det=%s, reco=%s) "
+                "(first call: weight download + init)",
+                device_label, _OCR_DET_ARCH, _OCR_RECO_ARCH,
+            )
+            model = ocr_predictor(
+                det_arch=_OCR_DET_ARCH,
+                reco_arch=_OCR_RECO_ARCH,
+                pretrained=True,
+                assume_straight_pages=True,
+            )
+            if use_cuda:
+                try:
+                    model = model.cuda()
+                    logger.info("docTR predictor moved to CUDA")
+                except Exception as e:
+                    logger.warning(
+                        "Failed to move docTR predictor to CUDA (%s); staying on CPU", e,
+                    )
+            _OCR_MODEL = model
+            return _OCR_MODEL
+        finally:
+            if lock_handle is not None:
+                try:
+                    import fcntl
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+                except Exception:
+                    pass
+                lock_handle.close()
 
 
 # Per-page threshold: a page that returns at least this many non-whitespace
@@ -940,6 +996,7 @@ def _is_property_photo(image_bytes: bytes) -> bool:
 
     b64 = base64.b64encode(image_bytes).decode()
     payload = {
+        "num_keep": 0,
         "model": CARD_READER_PHOTO_CLASSIFICATION_MODEL,
         "messages": [{
             "role": "user",
@@ -1277,6 +1334,7 @@ def fill_from_photo(data: dict, image_bytes: bytes) -> dict:
             "messages": [{"role": "user", "content": prompt, "images": [b64]}],
             "stream": False,
             "think": False,
+            "num_keep": 0
         }
         with httpx.Client(base_url=CARD_READER_OLLAMA_HOST, timeout=300) as client:
             resp = client.post("/api/chat", json=payload)
@@ -1766,3 +1824,38 @@ def extract_data(state: AgentState) -> dict:
     data = _drop_unverified_none(data, text)
     logger.info("Extracted %d fields from PDF text", len(data))
     return {"property_data": data}
+
+
+# Kick off model load in a background daemon thread at import time.
+# Why this exists: when many threads / Ray actors call read_property_card
+# concurrently very soon after import, they all hit _get_ocr_model() at
+# roughly the same moment, all see _OCR_MODEL is None, and pile up on
+# the first-call lock. Worse, if the cache miss triggers a download,
+# multiple processes (which the in-process lock can't coordinate) race
+# on the same .pt path. By starting the load before any caller arrives,
+# the download finishes once and all subsequent callers hit the
+# already-populated singleton on the lock-free fast path.
+#
+# Daemon thread (not import-time blocking call) so importing the module
+# stays fast for code paths that don't actually need OCR (tests, dry
+# runs, etc.). Errors here are swallowed and logged — the lazy lock
+# path still works as a fallback if the eager warm fails.
+def _eager_warm_ocr_model() -> None:
+    try:
+        _get_ocr_model()
+    except Exception as e:
+        logger.warning(
+            "Background OCR warm failed (%s); first-call lazy load will retry", e,
+        )
+
+
+# Module-level guard so the warm thread is started exactly once even if
+# the module gets re-imported (e.g. via importlib.reload). The truthy
+# check is read without a lock; the worst case is two threads briefly,
+# both of which serialise on _OCR_MODEL_LOCK inside _get_ocr_model.
+if os.environ.get("CARD_READER_NO_EAGER_WARM") != "1":
+    threading.Thread(
+        target=_eager_warm_ocr_model,
+        daemon=True,
+        name="docTR-ocr-warm",
+    ).start()
