@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import warnings
 
 import httpx
@@ -586,7 +587,17 @@ def download_pdf(state: AgentState) -> dict:
 # ~/.cache/doctr/ on first call and re-used for subsequent OCR runs in the
 # same process. Loading is deferred until first use so importing this
 # module stays fast and doesn't pull torch into RAM unnecessarily.
+#
+# The lock guards the lazy initialiser against the classic check-then-act
+# race: without it, N threads calling _get_ocr_model() concurrently before
+# the first model load completes will all see _OCR_MODEL is None, all
+# call doctr's downloader, and clobber each other writing the same
+# weights file (manifests as: "corrupted download, the hash of ... does
+# not match its expected value"). With the lock, only the first thread
+# downloads + initialises; the rest wait, observe the populated
+# _OCR_MODEL on the inner check, and return the same predictor.
 _OCR_MODEL = None
+_OCR_MODEL_LOCK = threading.Lock()
 
 # OCR architecture — picking the highest-accuracy models docTR ships.
 # Detection: db_resnet50 (top of docTR's published recall/precision on
@@ -610,7 +621,15 @@ _OCR_RENDER_SCALE = float(os.getenv("CARD_READER_OCR_RENDER_SCALE", "4"))
 
 
 def _get_ocr_model():
-    """Return the lazy-loaded docTR OCR predictor.
+    """Return the lazy-loaded docTR OCR predictor (thread-safe singleton).
+
+    Uses double-checked locking so the steady-state fast path is
+    lock-free: callers only acquire ``_OCR_MODEL_LOCK`` until the first
+    initialisation completes, after which every subsequent call just
+    reads the already-populated ``_OCR_MODEL`` and returns. The lock
+    matters because docTR's first-call download writes weights to
+    ``~/.cache/doctr/`` non-atomically — concurrent first-call threads
+    will both invoke the downloader and corrupt the file.
 
     Built with ``assume_straight_pages=True`` to skip the rotation-correction
     pass — county cards are always upright, so paying for skew estimation
@@ -619,7 +638,16 @@ def _get_ocr_model():
     CUDA build or no usable GPU.
     """
     global _OCR_MODEL
-    if _OCR_MODEL is None:
+    # Fast path: model already loaded, no lock needed.
+    if _OCR_MODEL is not None:
+        return _OCR_MODEL
+
+    with _OCR_MODEL_LOCK:
+        # Re-check under the lock — another thread may have finished
+        # loading while we were blocked acquiring it.
+        if _OCR_MODEL is not None:
+            return _OCR_MODEL
+
         from doctr.models import ocr_predictor
         try:
             import torch
@@ -648,7 +676,7 @@ def _get_ocr_model():
                     "Failed to move docTR predictor to CUDA (%s); staying on CPU", e,
                 )
         _OCR_MODEL = model
-    return _OCR_MODEL
+        return _OCR_MODEL
 
 
 # Per-page threshold: a page that returns at least this many non-whitespace
