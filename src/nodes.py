@@ -243,11 +243,23 @@ Field mapping guide:
         column header on a construction-detail row IS the heating label —
         do not skip it just because the word "heating" is absent.
 
-        Expand common abbreviations to their full canonical form:
+        Expand these abbreviations to their full canonical form ONLY
+        when the abbreviation appears in the value cell directly next
+        to a heating-system label (one of the labels listed above):
         "CTRL"/"CENT"/"CNTL" -> CENTRAL, "FA"/"F/A" -> FORCED AIR,
         "HP"/"H/P" -> HEAT PUMP, "BB"/"BSBD" -> BASEBOARD,
         "RAD" -> RADIANT, "GFA" -> FORCED AIR (gas-forced-air system).
         If the value cell shows e.g. "HEAT CTRL", emit heating="CENTRAL".
+
+        CRITICAL — do NOT expand bare 2-letter codes that appear
+        anywhere ELSE on the card. Property cards are full of stray
+        2-letter codes (district codes, map codes, class codes, parcel
+        prefixes, owner-state abbreviations, MH = mobile home, etc.).
+        A token like "HP", "FA", "BB" found loose in the text — not
+        adjacent to a heating-system label — is NOT the heating type
+        and MUST be ignored. If you cannot find a heating value
+        adjacent to a heating-system label, OMIT the heating field
+        entirely. Better empty than wrong.
 
         Do NOT confuse a fireplace appliance row ("FIREPLACE", "B-FIREPLACE
         GAS", "1-FIREPLACE") with the heating system. Those are features in
@@ -259,7 +271,8 @@ Field mapping guide:
         carrying a nonzero value. In that case the building has a CENTRAL
         forced-air HVAC system that does both heating and cooling — emit
         heating="CENTRAL AIR" (and cooling="CENTRAL AIR" per the cooling
-        rules below).
+        rules below). If the AC % is 0 or the Heat Fuel cell is empty,
+        do NOT apply this rule — OMIT heating entirely.
 
     heatfuel text -- Fuel used by the PRIMARY HEATING SYSTEM. Allowed values:
         GAS, OIL, ELECTRIC, PROPANE, WOOD, SOLAR, COAL, NONE.
@@ -525,15 +538,133 @@ def _is_pdf(content: bytes) -> bool:
     return content[:5] == b"%PDF-"
 
 
-def _html_to_pdf(html: bytes, url: str) -> bytes:
-    """Convert HTML content to PDF using pdfkit (wkhtmltopdf).
+_SCAN_IMG_EXT_RE = re.compile(r"\.(jpe?g|png|tiff?)(\?|$)", re.IGNORECASE)
+# Image-scan pages have at most a few hundred chars of header/disclaimer
+# chrome after stripping <script>/<style>/comments; rich assessor data
+# pages have thousands. 1500 sits comfortably between the two.
+_SCAN_IMG_TEXT_THRESHOLD = 1500
 
-    Feeds the already-fetched HTML to wkhtmltopdf via stdin so it doesn't
-    re-download the page (and so we don't need cert-bypass flags for the
-    main URL). A ``<base href="...">`` tag is injected so wkhtmltopdf can
-    resolve relative/protocol-relative URLs for sub-resources; any
-    sub-resources that still fail are ignored via ``load-error-handling``.
+
+def _extract_scan_image_urls(html: bytes, base_url: str) -> list[str]:
+    """Return resolved image URLs if the HTML is an image-only scan card.
+
+    Some assessor sites (e.g. richmondcountypropertycards.com) serve the
+    property card as an HTML wrapper around one or more JPEG scans of
+    the paper card. Routing those through wkhtmltopdf is destructive:
+    wkhtmltopdf re-encodes the JPEG into the rendered PDF and pypdfium2
+    later re-rasterises that PDF for OCR — two lossy passes that wipe
+    out thin glyphs (e.g. the "1" in "A-1" zoning codes).
+
+    When this heuristic fires, the caller should fetch the JPEGs
+    directly and build a PDF that embeds them at native resolution.
+
+    Heuristic — return URLs only if BOTH:
+    1. There is at least one ``<img>`` whose src looks like a raster
+       photo (.jpg/.jpeg/.png/.tif/.tiff). Vector logos (.svg, .gif)
+       and tracking pixels are ignored.
+    2. After stripping all tags, the HTML contains less than
+       ``_SCAN_IMG_TEXT_THRESHOLD`` non-whitespace characters of body
+       text. Any HTML with substantive text content (real assessor
+       data tables) falls through to wkhtmltopdf.
+
+    Conservative by design: any uncertainty falls through to the
+    existing wkhtmltopdf path.
     """
+    from urllib.parse import urljoin
+
+    html_str = html.decode("utf-8", errors="replace")
+
+    img_srcs = re.findall(
+        r'<img[^>]+src\s*=\s*["\']([^"\']+)["\']',
+        html_str,
+        flags=re.IGNORECASE,
+    )
+    scan_srcs = [
+        src for src in img_srcs
+        if _SCAN_IMG_EXT_RE.search(src) and not src.startswith("data:")
+    ]
+    if not scan_srcs:
+        return []
+
+    # Strip <script>, <style>, and HTML comments before counting body
+    # text — inline CSS rules and JS blobs are not "content" and would
+    # otherwise push every page over the threshold.
+    body = re.sub(r"<script\b[^>]*>.*?</script>", " ", html_str, flags=re.IGNORECASE | re.DOTALL)
+    body = re.sub(r"<style\b[^>]*>.*?</style>", " ", body, flags=re.IGNORECASE | re.DOTALL)
+    body = re.sub(r"<!--.*?-->", " ", body, flags=re.DOTALL)
+    text_only = re.sub(r"<[^>]+>", " ", body)
+    text_only = re.sub(r"\s+", " ", text_only).strip()
+    if len(text_only) >= _SCAN_IMG_TEXT_THRESHOLD:
+        return []
+
+    return [urljoin(base_url, src) for src in scan_srcs]
+
+
+def _images_to_pdf(image_urls: list[str]) -> bytes:
+    """Fetch raster scans and assemble a PDF that embeds them losslessly.
+
+    Each image becomes one PDF page sized to match the image's native
+    pixel dimensions. PIL writes JPEGs into the PDF stream verbatim
+    (no re-encoding), so the downstream pypdfium2 render pass is a
+    pure upsample — no signal loss vs. the source scan.
+    """
+    import io
+
+    from PIL import Image
+
+    images: list[Image.Image] = []
+    with httpx.Client(
+        timeout=60,
+        follow_redirects=True,
+        verify=False,
+        headers={"user-agent": _BROWSER_UA},
+    ) as client:
+        for url in image_urls:
+            resp = client.get(url)
+            resp.raise_for_status()
+            img = Image.open(io.BytesIO(resp.content))
+            # PDF can't carry alpha; flatten to RGB if needed.
+            if img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
+            images.append(img)
+
+    if not images:
+        raise RuntimeError("No images fetched from scan URLs")
+
+    buf = io.BytesIO()
+    head, *rest = images
+    head.save(buf, format="PDF", save_all=True, append_images=rest)
+    return buf.getvalue()
+
+
+def _html_to_pdf(html: bytes, url: str) -> bytes:
+    """Convert HTML content to PDF.
+
+    Two paths:
+
+    1. **Image-scan HTML** (assessor sites that wrap JPEGs of the paper
+       card in a thin HTML shell). Detected via
+       :func:`_extract_scan_image_urls`; the source images are fetched
+       directly and embedded into a PDF at native resolution. This
+       avoids the wkhtmltopdf + pypdfium2 double-rasterisation that
+       drops thin glyphs in OCR.
+
+    2. **Rich HTML** (server-rendered assessor reports with real text
+       and tables). Sent to wkhtmltopdf via stdin so it doesn't
+       re-download the page. A ``<base href="...">`` tag is injected
+       so wkhtmltopdf can resolve relative/protocol-relative URLs for
+       sub-resources; any sub-resources that still fail are ignored
+       via ``load-error-handling``.
+    """
+    scan_urls = _extract_scan_image_urls(html, url)
+    if scan_urls:
+        logger.info(
+            "HTML wraps %d scan image(s); embedding directly into PDF "
+            "(bypassing wkhtmltopdf to preserve OCR fidelity)",
+            len(scan_urls),
+        )
+        return _images_to_pdf(scan_urls)
+
     import pdfkit
 
     logger.info("URL returned HTML; converting to PDF via pdfkit")
@@ -1755,6 +1886,10 @@ def _infer_heating_from_central_air(data: dict, text: str) -> dict:
       - the OCR/native text actually contains a "Central Air" or
         "Central A/C" token (don't trust a cooling value the LLM might
         have invented out of nowhere)
+      - the AC% is NOT explicitly zero. Cards like the Henry mobile-home
+        layout show "Central Air % 0", which means the AC option on the
+        card line *exists* but the value is none — the building has no
+        central air, so we should not infer central-air heating.
     """
     if data.get("heating"):
         return data
@@ -1767,6 +1902,19 @@ def _infer_heating_from_central_air(data: dict, text: str) -> dict:
         return data
 
     if not re.search(r"\bcentral\s*(?:air|a\s*/?\s*c)\b", text, re.IGNORECASE):
+        return data
+
+    # Suppress when the card explicitly shows AC %/value is zero — e.g.
+    # "Central Air % 0", "Central Air % : 0", "AC % 0". The presence of
+    # the label doesn't mean AC is installed.
+    if re.search(
+        r"\bcentral\s*(?:air|a\s*/?\s*c)\s*(?:%|percent)?\s*[:\-]?\s*0\b",
+        text,
+        re.IGNORECASE,
+    ):
+        logger.info(
+            "Skipping heating-from-cooling inference: Central Air %% is 0",
+        )
         return data
 
     data["heating"] = cooling_upper
