@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "landrecords-card-reader"
-version = "0.6.4"
+version = "0.6.11"
 description = "Extract structured property data from assessment card PDFs using LLM-powered text extraction"
 readme = "README.md"
 license = "MIT"
@@ -61,6 +61,13 @@ packages = ["landrecords_card_reader", "landrecords_card_reader.tests"]
 "landrecords_card_reader.tests" = "src/tests"
 
 [tool.pytest.ini_options]
+# -s (--capture=no) is needed so the LLM streaming output written by
+# _stream_llm via raw sys.stderr.write reaches the terminal in real
+# time. Without it pytest captures stderr at the file-descriptor
+# level and the streaming bytes are buffered until the test finishes,
+# which defeats the streaming. The streaming itself is gated by the
+# CARD_READER_STREAM_TO_CONSOLE env var, set in src/tests/conftest.py.
+addopts = "-s"
 log_cli = true
 log_cli_level = "INFO"
 log_cli_format = "%(asctime)s %(name)s %(levelname)s %(message)s"

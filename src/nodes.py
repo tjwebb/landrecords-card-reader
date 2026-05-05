@@ -70,13 +70,84 @@ VALID_COLUMNS = {
 }
 
 # ---------------------------------------------------------------------------
+# Chunked positional output schema for the extraction LLM.
+#
+# Why chunks: the LLM is asked to emit ONE labelled CSV row per chunk
+# instead of a single 94-cell row. A long-row positional format is
+# brittle — the model has to count to 94 commas with most cells empty,
+# and a single missed comma shifts every subsequent field by one
+# position, corrupting the whole extraction. Chunking caps each row
+# at ~10 cells so:
+#
+#   * The model only ever counts within a short, comprehensible block.
+#   * An off-by-one in one chunk corrupts only that chunk's ~10
+#     fields, not all 94.
+#   * Per-chunk parsing is independent — a malformed chunk doesn't
+#     poison neighbouring chunks.
+#   * No per-field key strings are emitted (the original token-saving
+#     reason for going to a positional format), only ~14 short chunk
+#     labels per response.
+#
+# DO NOT reorder columns within a chunk without updating the prompt's
+# CHUNKS section — the LLM has no way to recover from a column-order
+# drift, and downstream code would mis-attribute fields. Adding a new
+# chunk also requires updating EXTRACTION_PROMPT_CHUNK_LIST.
+# ---------------------------------------------------------------------------
+EXTRACTION_CHUNKS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("IDS", ("parcelid", "parcelid2", "taxacctnum", "taxyear")),
+    ("ZONE", ("usecode", "usedesc", "zoningcode", "zoningdesc",
+              "landusecode", "landusedesc", "taxdistrict")),
+    ("BUILD", ("yearbuilt", "yearremodel", "bldgsqft", "livingarea",
+               "numfloors", "numbldgs", "numunits", "bldgtype",
+               "bldgquality", "bldgcondition")),
+    ("ROOMS", ("bedrooms", "halfbaths", "fullbaths", "totalrooms",
+               "fireplaces", "architecture")),
+    ("HVAC", ("heating", "heatfuel", "cooling")),
+    ("STRUCT", ("foundation", "attic", "atticsqft", "intwall", "extwall",
+                "roofstyle", "roofcover", "roofheight")),
+    ("EXTERIOR", ("fsagpfeet", "siding", "framing", "basementsqft",
+                  "attgaragesqft", "detgaragesqft", "garagestalls")),
+    ("VALUE", ("imprvalue", "landvalue", "agvalue", "totalvalue",
+               "appraisedvalue", "assessedvalue", "saleamt", "saledate",
+               "taxacres")),
+    ("OWNER", ("ownername", "owneraddr", "ownercity", "ownerstate",
+               "ownerzip")),
+    ("PARCEL", ("parceladdr", "parcelcity", "parcelstate", "parcelzip",
+                "situsaddress", "legaldesc")),
+    ("LEGAL", ("book", "page", "block", "lot")),
+    ("LOC", ("house", "category", "near", "house_number", "road", "unit",
+             "level")),
+    ("FEAT1", ("boatlift", "boatdock", "boathouse", "pool", "gazebo",
+               "irrigation", "riprap", "solarium", "carport")),
+    ("FEAT2", ("greenhouse", "openporch", "enclporch", "sauna", "wooddeck",
+               "hottub", "patio", "shed", "workshop")),
+)
+_chunk_columns: list[str] = [c for _, cols in EXTRACTION_CHUNKS for c in cols]
+assert set(_chunk_columns) == VALID_COLUMNS and len(_chunk_columns) == len(VALID_COLUMNS), (
+    f"EXTRACTION_CHUNKS drift: missing={VALID_COLUMNS - set(_chunk_columns)}, "
+    f"extra={set(_chunk_columns) - VALID_COLUMNS}, "
+    f"duplicates={len(_chunk_columns) - len(set(_chunk_columns))}"
+)
+del _chunk_columns
+
+
+# ---------------------------------------------------------------------------
 # Extraction prompt template
 # ---------------------------------------------------------------------------
 EXTRACTION_PROMPT = """\
 You are a property data extraction expert. Below is the raw OCR output of a
 property card document — it may contain layout artifacts, line-broken
 labels, and minor OCR errors. Extract all available property information
-and return ONLY a valid JSON object. DO NOT print any null values.
+and return ONE labelled CSV row per chunk listed under "CHUNKS" below.
+Each line of your output is exactly:
+
+    LABEL:cell1,cell2,cell3,...
+
+where ``LABEL`` is the chunk label (uppercase, exact spelling), and the
+cells are the extracted values for that chunk's columns IN THE ORDER
+LISTED for that chunk. You do NOT count columns across chunks — each
+chunk is independent and short (≤ 10 cells), so within-chunk counting
+is the only counting you have to do.
 
 Field mapping guide:
     parcelid text -- Unique identifier for the parcel, e.g. apn, pid, pin, parcel_number, gpin.
@@ -184,8 +255,27 @@ Field mapping guide:
     taxacres float8 -- Assessed acres of the parcel.
     saleamt int8 -- Amount of the most recent for the parcel. IGNORE older sale records if multiple are present.
     saledate date -- Date of the most recent sale of the parcel. IGNORE older sale records if multiple are present.
-    ownername text -- Name of the parcel owner.
-    owneraddr text -- Address of the parcel owner.
+    ownername text -- Full name of the parcel owner, as ONE value.
+
+        CRITICAL: many property cards print the owner name across two
+        or three lines on the page (e.g. last name on line 1, first +
+        middle on line 2, joint owner on line 3 — "REAVES" /
+        "JAMES MICHAEL" / "& JANE DOE"). These multi-line printings
+        are a SINGLE owner-name value — concatenate them into one
+        cell with single spaces between segments
+        ("REAVES JAMES MICHAEL & JANE DOE"). Do NOT split a name
+        across multiple cells. owneraddr is the MAILING ADDRESS, not
+        a name fragment; if the value you'd put in owneraddr does
+        not look like a street/PO-box/city address, you have split
+        the name incorrectly — fold it back into ownername.
+
+    owneraddr text -- Mailing address of the parcel owner. This is
+        a STREET ADDRESS or PO BOX line — number + street name (e.g.
+        "PO BOX 453", "101 SPRING HAVEN DR", "1234 ELM ST APT 5").
+        It is NOT a name, name fragment, city, or state. If you do
+        not see a clear street/PO-box address line for the owner,
+        OMIT this field — never use it as overflow for a long owner
+        name.
     ownercity text -- City of the parcel owner.
     ownerstate text -- State of the parcel owner.
 
@@ -381,19 +471,55 @@ Field mapping guide:
 );
 
 Rules:
-- Do not include any NULL values; omit fields that are null.
-- Return ONLY valid JSON — no markdown, no explanation, no code fences.
-- Monetary values must be integers with no $ signs or commas.
-- Dates must be in YYYY-MM-DD format.
-- Numeric fields must be numbers, not strings.
+- Emit ONE line per chunk in the CHUNKS list below — every chunk
+  must appear, in the order given, even if all of its cells are
+  empty. Each line is ``LABEL:`` followed by exactly the number of
+  cells the chunk specifies, separated by commas. Position WITHIN
+  THE CHUNK is significant — emit a comma for every column whether
+  or not you have a value for it.
+- RFC 4180 quoting: wrap any cell value containing a comma or
+  double-quote in double-quotes. Inside a quoted cell, escape an
+  internal double-quote by doubling it. Cells without those
+  characters do NOT need quoting.
+- VALUES ARE SINGLE-LINE. Never put a newline inside a cell value,
+  even if the source card prints the value across multiple lines.
+  If a value on the source card spans multiple lines (e.g. a
+  multi-line owner name like "REAVES" + "JAMES MICHAEL", a
+  multi-line legal description, or a multi-line address),
+  CONCATENATE the lines into a single cell with single spaces
+  between segments. The line break exists in the source layout
+  only — it is not part of the value.
+- Leave a cell EMPTY (a bare comma) if the card does not provide a
+  value. Do NOT substitute ``N/A``, ``NA``, ``UNKNOWN``, ``UNK``,
+  ``null``, ``-``, ``--``, ``0``, or any other placeholder for
+  missing data.
+- "NONE" is a real value, NOT a placeholder. Only emit the literal
+  text ``NONE`` for a cell when the card EXPLICITLY shows the text
+  "NONE" (or "None") as that field's value. If a card cell is
+  blank, dashed, whitespace-only, or absent, leave the CSV cell
+  EMPTY — never write NONE for missing data.
+- Monetary values: integer, no ``$`` sign, no thousands commas
+  inside the cell. The CSV comma is only the field separator.
+- Dates: YYYY-MM-DD (e.g. ``2021-05-28``).
+- Numeric fields: bare numbers, no quotes, no units.
+- Boolean cells: leave EMPTY when the card does not address the
+  feature. Emit ``true`` only when the card explicitly indicates the
+  feature is present; emit ``false`` only when the card explicitly
+  indicates it is absent.
+- No JSON, no markdown, no code fences, no commentary, no header
+  row. Each line is ``LABEL:cells``. One line per chunk. Nothing
+  else.
 - It's okay if data is missing, but do not guess or fabricate data.
-- "NONE" is a real value, NOT a placeholder. Only emit "NONE" for a field
-  when the card EXPLICITLY shows the literal text "NONE" (or "None") as
-  that field's value. If a field's cell is blank, dashed, empty,
-  whitespace-only, or absent — OMIT the field entirely. Do not substitute
-  "NONE" / "N/A" / "UNKNOWN" / "" / 0 for missing data.
-- parcelid, parcelid2, and taxacctnum cannot be equal to each other, or any other value on the card.
-- heating and heatfuel cannot be equal to each other
+- parcelid, parcelid2, and taxacctnum cannot be equal to each other,
+  or any other value on the card.
+- heating and heatfuel cannot be equal to each other.
+
+CHUNKS (emit one line per chunk, cells in this exact order):
+{chunk_spec}
+
+EXAMPLE OUTPUT (illustrative — use values from the actual document
+below, not these):
+{chunk_example}
 
 DOCUMENT TEXT:
 {document_text}"""
@@ -405,8 +531,19 @@ DOCUMENT TEXT:
 
 
 def _stream_llm(messages: list[dict], *, label: str = "extraction") -> str:
-    """Stream a chat completion from Ollama and return the full response text."""
-    stream_to_console = logger.isEnabledFor(logging.DEBUG)
+    """Stream a chat completion from Ollama and return the full response text.
+
+    When ``CARD_READER_STREAM_TO_CONSOLE=1`` is set in the environment,
+    each response chunk is also written to stderr as it arrives, so the
+    LLM's output can be watched live (useful for tests and interactive
+    debugging). The stream-to-console flag is decoupled from the log
+    level so that turning on streaming doesn't also enable verbose
+    DEBUG logging from the rest of the module.
+    """
+    stream_to_console = (
+        os.environ.get("CARD_READER_STREAM_TO_CONSOLE", "").lower()
+        in ("1", "true", "yes")
+    )
 
     payload = {
         "model": CARD_READER_EXTRACTION_MODEL,
@@ -476,6 +613,161 @@ def _parse_json_response(text: str) -> dict:
     raise json.JSONDecodeError("No JSON object found in response", text, 0)
 
 
+_CSV_PLACEHOLDER_VALUES = {
+    "", "N/A", "NA", "UNKNOWN", "UNK", "NULL", "-", "--",
+}
+
+
+def _parse_chunked_csv(
+    text: str,
+    chunks: tuple[tuple[str, tuple[str, ...]], ...],
+) -> dict:
+    """Parse the LLM's chunked-CSV response into a dict.
+
+    Each chunk is one line of the form ``LABEL:cell1,cell2,...``.
+    Per-chunk parsing is independent — a malformed chunk only
+    loses its own ≤10 fields, not subsequent chunks' fields, which
+    is the whole point of chunking vs. a single 94-cell row.
+
+    Defenses against typical model output noise:
+
+    - Strips ``<think>...</think>`` reasoning blocks (qwen3-style)
+    - Strips markdown code fences (```csv ... ``` etc.)
+    - Skips lines without a colon, lines starting with JSON syntax,
+      and lines whose label isn't in ``chunks``
+    - Pads / truncates each chunk row to the expected cell count
+      (logging WARNING) rather than dropping the whole chunk
+    - First-write-wins on key collisions (across chunks)
+    - csv.reader handles RFC-4180 quoting for cells that contain
+      commas, double-quotes, or embedded newlines
+
+    Raises ``ValueError`` only when the response yields zero
+    recognised fields across all chunks, so the caller can retry.
+    """
+    import csv
+    import io
+
+    text = re.sub(r"<think>[\s\S]*?</think>", "", text).strip()
+    m = re.search(r"```[a-zA-Z]*\s*([\s\S]*?)```", text)
+    if m:
+        text = m.group(1).strip()
+
+    chunk_map = {label: cols for label, cols in chunks}
+    out: dict = {}
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or ":" not in line:
+            continue
+        if line[0] in "{}[]":
+            continue
+
+        label, _, csv_part = line.partition(":")
+        label = label.strip().upper()
+        if label not in chunk_map:
+            continue
+
+        cols = chunk_map[label]
+        expected = len(cols)
+
+        try:
+            row = next(csv.reader(io.StringIO(csv_part), delimiter=",", quotechar='"'))
+        except StopIteration:
+            row = []
+
+        if len(row) != expected:
+            logger.warning(
+                "Chunk %s has %d cells, expected %d — pad/truncating; "
+                "fields in this chunk may be misaligned",
+                label, len(row), expected,
+            )
+            if len(row) < expected:
+                row = row + [""] * (expected - len(row))
+            else:
+                row = row[:expected]
+
+        for col, val in zip(cols, row):
+            # Collapse any internal whitespace — including newlines
+            # the model may have leaked into a quoted multi-line
+            # cell — into single spaces. Property data fields don't
+            # need preserved internal whitespace, and this prevents
+            # multi-line owner names / addresses / legal
+            # descriptions from carrying line breaks into the
+            # extracted dict.
+            v = re.sub(r"\s+", " ", val.strip().strip('"')).strip()
+            if not v or v.upper() in _CSV_PLACEHOLDER_VALUES:
+                continue
+            if col not in out:
+                out[col] = v
+
+    if not out:
+        raise ValueError(
+            f"No chunks recognised in extraction response: {text[:500]!r}"
+        )
+    return out
+
+
+def _build_chunk_spec(
+    chunks: tuple[tuple[str, tuple[str, ...]], ...]
+) -> str:
+    """Render the CHUNKS section of the extraction prompt.
+
+    Each line names a chunk label and its column order, formatted as
+    ``LABEL (N cells): col1, col2, ...``. The cell count is shown
+    explicitly so the model has a single number to count toward.
+    """
+    return "\n".join(
+        f"- {label} ({len(cols)} cells): {', '.join(cols)}"
+        for label, cols in chunks
+    )
+
+
+def _build_chunk_example(
+    chunks: tuple[tuple[str, tuple[str, ...]], ...]
+) -> str:
+    """Render an illustrative output example showing exact format.
+
+    Uses the Carroll County 0000033118 card values (a real, verified
+    extraction) so the example doesn't accidentally teach malformed
+    cells. Any field not populated for that card is shown as an
+    empty cell so the model sees the all-empty pattern (`,,,,`)
+    explicitly.
+    """
+    sample: dict[str, str] = {
+        "parcelid": "126-12-8",
+        "taxacctnum": "33789",
+        "yearbuilt": "2011",
+        "bldgsqft": "1904",
+        "bedrooms": "2",
+        "imprvalue": "452700",
+        "landvalue": "46600",
+        "totalvalue": "499300",
+        "taxacres": "3.323",
+        "ownername": '"BYRD CHARLES L JR & POOLE JENNIFER A"',
+        "parceladdr": "101 SPRING HAVEN DR",
+        "parcelcity": "FANCY GAP",
+        "parcelstate": "VA",
+        "parcelzip": "24328",
+        "heating": "HEAT PUMP",
+        "heatfuel": "ELECTRIC",
+        "cooling": "CENTRAL AIR",
+        "roofstyle": "GABLE",
+        "roofcover": "METAL",
+        "extwall": "HARDIPLANK",
+        "saledate": "2021-05-28",
+        "saleamt": "345000",
+    }
+    lines: list[str] = []
+    for label, cols in chunks:
+        cells = ",".join(sample.get(c, "") for c in cols)
+        lines.append(f"{label}:{cells}")
+    return "\n".join(lines)
+
+
+_CHUNK_SPEC = _build_chunk_spec(EXTRACTION_CHUNKS)
+_CHUNK_EXAMPLE = _build_chunk_example(EXTRACTION_CHUNKS)
+
+
 # Placeholder strings the LLM occasionally emits despite being told to omit
 # missing fields. These are NEVER kept; "NONE" is allowed only if the OCR
 # text explicitly contains it (verified separately by _drop_unverified_none).
@@ -485,10 +777,16 @@ _PLACEHOLDER_STRINGS = {"N/A", "NA", "UNKNOWN", "UNK", "NULL", "-", "--"}
 def _coerce_types(data: dict) -> dict:
     """Coerce extracted values to their expected Python types."""
     int_fields = {
-        "taxyear", "numbldgs", "numunits", "yearbuilt", "numfloors",
-        "bldgsqft", "bedrooms", "halfbaths", "fullbaths", "fireplaces",
+        "taxyear", "numbldgs", "numunits", "yearbuilt", "yearremodel",
+        "numfloors", "bldgsqft", "livingarea", "bedrooms", "halfbaths",
+        "fullbaths", "totalrooms", "fireplaces", "atticsqft", "roofheight",
+        "fsagpfeet", "basementsqft", "attgaragesqft", "detgaragesqft",
+        "garagestalls",
     }
-    bigint_fields = {"imprvalue", "landvalue", "agvalue", "totalvalue", "saleamt"}
+    bigint_fields = {
+        "imprvalue", "landvalue", "agvalue", "totalvalue", "saleamt",
+        "appraisedvalue", "assessedvalue",
+    }
     float_fields = {"taxacres" }
 
     coerced: dict = {}
@@ -539,10 +837,23 @@ def _is_pdf(content: bytes) -> bool:
 
 
 _SCAN_IMG_EXT_RE = re.compile(r"\.(jpe?g|png|tiff?)(\?|$)", re.IGNORECASE)
+# Filename / URL substrings that mark an <img> as branding/chrome (a
+# county logo, navigation icon, layout spacer) rather than a property-
+# card scan. Matching here removes the IMG from scan-candidate
+# consideration entirely — important for rich-data HTML pages
+# (e.g. Arlington's property search) that embed a county logo: without
+# this filter the logo would falsely qualify the page as "image-only"
+# and route it through the scan-bypass instead of wkhtmltopdf.
+_SCAN_IMG_BLACKLIST_RE = re.compile(
+    r"logo|icon|banner|spacer|pixel|favicon|sprite|background|placeholder",
+    re.IGNORECASE,
+)
 # Image-scan pages have at most a few hundred chars of header/disclaimer
 # chrome after stripping <script>/<style>/comments; rich assessor data
-# pages have thousands. 1500 sits comfortably between the two.
-_SCAN_IMG_TEXT_THRESHOLD = 1500
+# pages have thousands. 1000 keeps the known scan card (Richmond, ~860
+# chars of boilerplate) within bounds while excluding pages with even
+# modest amounts of property data text (Arlington, ~1467 chars).
+_SCAN_IMG_TEXT_THRESHOLD = 1000
 
 
 def _extract_scan_image_urls(html: bytes, base_url: str) -> list[str]:
@@ -581,7 +892,9 @@ def _extract_scan_image_urls(html: bytes, base_url: str) -> list[str]:
     )
     scan_srcs = [
         src for src in img_srcs
-        if _SCAN_IMG_EXT_RE.search(src) and not src.startswith("data:")
+        if _SCAN_IMG_EXT_RE.search(src)
+        and not src.startswith("data:")
+        and not _SCAN_IMG_BLACKLIST_RE.search(src)
     ]
     if not scan_srcs:
         return []
@@ -957,6 +1270,95 @@ def _pdfium_render_worker(
     return images
 
 
+_INLINE_CLIP_MIN_DPI = 150
+_INLINE_CLIP_MAX_DPI = 600
+
+
+def _pymupdf_clip_worker(
+    content: bytes,
+    clips: list[tuple[int, tuple[float, float, float, float], int]],
+) -> list[bytes]:
+    """Subprocess entry point: rasterise per-bbox PDF regions to JPEG bytes.
+
+    ``clips`` is a list of ``(page_index, (x0, y0, x1, y1), native_w_px)``
+    tuples in PDF user-space points. Each region is rendered to JPEG
+    at the DPI required to preserve the source image's native pixel
+    width within the bbox, clamped to
+    ``[_INLINE_CLIP_MIN_DPI, _INLINE_CLIP_MAX_DPI]``.
+
+    Why per-clip DPI: an inline image embedded at small page-size but
+    high source resolution (typical for property-card photos: 2250 px
+    in a 283 pt = 3.9 inch wide region) would be downsampled ~4× at
+    a fixed 150 DPI. The vision-model classifier rejects the
+    downsampled images. Computing DPI from native_w_px keeps the
+    render at native resolution.
+
+    Defined at module level so ``multiprocessing`` (spawn context) can
+    pickle and import it in the child interpreter. Caller is
+    :func:`_clip_pdf_regions`; do not invoke directly.
+
+    Why subprocess: pymupdf's mupdf backend has segfaulted reproducibly
+    on certain wkhtmltopdf-generated PDFs when calling get_pixmap with
+    a clip rect. A SIGSEGV in C-extension code is fatal to the whole
+    process, but in a subprocess it's fatal only to the subprocess —
+    the parent gets a clean BrokenProcessPool exception and can carry
+    on with no inline photos.
+    """
+    import io
+    import pymupdf as fitz
+
+    doc = fitz.open(stream=content, filetype="pdf")
+    out: list[bytes] = []
+    try:
+        for page_idx, bbox, native_w_px in clips:
+            x0, _, x1, _ = bbox
+            bbox_w_pt = max(x1 - x0, 1.0)
+            needed = int(72.0 * native_w_px / bbox_w_pt) if native_w_px > 0 else _INLINE_CLIP_MIN_DPI
+            dpi = max(_INLINE_CLIP_MIN_DPI, min(needed, _INLINE_CLIP_MAX_DPI))
+            page = doc[page_idx]
+            pix = page.get_pixmap(clip=fitz.Rect(*bbox), dpi=dpi)
+            buf = io.BytesIO()
+            buf.write(pix.tobytes("jpeg"))
+            out.append(buf.getvalue())
+    finally:
+        doc.close()
+    return out
+
+
+def _clip_pdf_regions(
+    content: bytes,
+    clips: list[tuple[int, tuple[float, float, float, float], int]],
+) -> list[bytes]:
+    """Rasterise per-bbox PDF regions to JPEG bytes in an isolated subprocess.
+
+    Returns one JPEG per clip in input order. Returns an empty list if
+    the subprocess crashes (segfault, broken pool, etc.) — callers
+    should treat that as "no inline photos available" rather than a
+    hard failure.
+
+    Spawn context (not fork) for the same reason as
+    :func:`_render_pages_with_pdfium`: avoid copy-on-write inheritance
+    of docTR/PyTorch state in the child.
+    """
+    if not clips:
+        return []
+
+    import multiprocessing
+    from concurrent.futures import BrokenExecutor, ProcessPoolExecutor
+
+    ctx = multiprocessing.get_context("spawn")
+    try:
+        with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as pool:
+            future = pool.submit(_pymupdf_clip_worker, content, clips)
+            return future.result()
+    except (BrokenExecutor, OSError) as e:
+        logger.warning(
+            "Inline-image rasterisation subprocess crashed (%s); "
+            "skipping %d inline image(s)", e, len(clips),
+        )
+        return []
+
+
 def _render_pages_with_pdfium(content: bytes, page_indices: list[int]) -> list[bytes]:
     """Render specific PDF pages to PNG bytes in an isolated subprocess.
 
@@ -1173,11 +1575,12 @@ def extract_property_photos(state: AgentState) -> dict:
 
     MIN_DIM = 200          # smallest side, in image pixels
     MAX_ASPECT_RATIO = 4   # skip very long banners
-    CLIP_DPI = 150         # render dpi for inline (xref=0) images
 
     content = state["pdf_content"]
     candidates: list[dict] = []
     seen_xrefs: set[int] = set()
+    inline_clips: list[tuple[int, tuple[float, float, float, float], int]] = []
+    inline_meta: list[dict] = []
 
     doc = fitz.open(stream=content, filetype="pdf")
     try:
@@ -1204,16 +1607,38 @@ def extract_property_photos(state: AgentState) -> dict:
                         "ext": extracted.get("ext", "bin"),
                         "bytes": extracted["image"],
                     })
-                # Inline images (xref == 0) would need page rasterization
-                # via page.get_pixmap — that path has segfaulted in mupdf
-                # on wkhtmltopdf-generated PDFs in certain Linux
-                # environments. Skip them: in practice property-card
-                # photos are virtually always embedded with xrefs (the
-                # path above), and HTML→PDF cards rarely have property
-                # photos at all. Better to miss a rare inline image than
-                # crash the worker.
+                else:
+                    # Inline image (xref == 0). Rasterising via
+                    # page.get_pixmap(clip=...) has segfaulted in mupdf
+                    # on wkhtmltopdf-generated PDFs, so we batch the
+                    # clips and run them in an isolated subprocess
+                    # below — a crash there is contained and we just
+                    # lose the inline photos for that PDF.
+                    #
+                    # The native pixel width (w) is passed through so
+                    # the worker can pick a DPI that preserves the
+                    # source image's resolution within the bbox —
+                    # property-card photos are routinely embedded at
+                    # 2000+ px in a 3-4 inch region, and a fixed 150
+                    # DPI render would downsample them ~4×, which the
+                    # vision classifier then rejects.
+                    bbox = info.get("bbox")
+                    if not bbox:
+                        continue
+                    inline_clips.append((page_num, tuple(bbox), w))
+                    inline_meta.append({
+                        "page": page_num + 1,
+                        "width": w,
+                        "height": h,
+                        "ext": "jpeg",
+                    })
     finally:
         doc.close()
+
+    if inline_clips:
+        rendered = _clip_pdf_regions(content, inline_clips)
+        for meta, jpeg in zip(inline_meta, rendered):
+            candidates.append({**meta, "bytes": jpeg})
 
     logger.info("Found %d candidate image(s), classifying with vision model", len(candidates))
 
@@ -1249,29 +1674,29 @@ def _run_extraction_llm(source_text: str, context: str | None = None) -> dict:
     If ``context`` is provided, it is appended to the extraction prompt as
     additional caller-supplied instructions.
     """
-    prompt = EXTRACTION_PROMPT.format(document_text=source_text)
+    prompt = EXTRACTION_PROMPT.format(
+        document_text=source_text,
+        chunk_spec=_CHUNK_SPEC,
+        chunk_example=_CHUNK_EXAMPLE,
+    )
     if context and context.strip():
         prompt = f"{prompt}\n\nAdditional instructions:\n{context.strip()}"
     logger.info("Extracting structured data (model=%s)", CARD_READER_EXTRACTION_MODEL)
 
     messages = [
-        {"role": "system", "content": "You are a precise data extraction assistant. Return only valid JSON."},
+        {
+            "role": "system",
+            "content": (
+                "You are a precise data extraction assistant. Return "
+                "ONLY one labelled CSV row per chunk as instructed — "
+                "no JSON, no markdown, no code fences, no prose."
+            ),
+        },
         {"role": "user", "content": prompt},
     ]
 
-    max_attempts = 3
-    for attempt in range(1, max_attempts + 1):
-        full_text = _stream_llm(messages, label="extraction")
-        try:
-            raw = _parse_json_response(full_text)
-            break
-        except json.JSONDecodeError:
-            logger.warning(
-                "Attempt %d/%d: could not parse JSON from response (length=%d): %.500s",
-                attempt, max_attempts, len(full_text), full_text,
-            )
-            if attempt == max_attempts:
-                raise
+    full_text = _stream_llm(messages, label="extraction")
+    raw = _parse_chunked_csv(full_text, EXTRACTION_CHUNKS)
     return _coerce_types(raw)
 
 
@@ -1510,16 +1935,24 @@ _HEATFUEL_TOKEN_MAP: list[tuple[str, str]] = [
 ]
 
 
-# Match a specific "Heat Fuel" / "Heating Fuel" / "Fuel Type" label only —
+# Anchor for a "Heat Fuel" / "Heating Fuel" / "Fuel Type" label only —
 # NOT a bare "fuel" (which would also match "B-FIREPLACE GAS" and similar
-# fireplace/appliance entries on the card). Captures up to 25 chars of
-# value text after the label.
-_HEATFUEL_LABEL_VALUE_RE = re.compile(
-    r"\b(?:heat\s*fuel|heating\s*fuel|fuel\s*type)\b"
-    r"\s*[:\-]?\s*"
-    r"([A-Za-z./\s\-]{1,25})",
+# fireplace/appliance entries on the card). After matching, the post-pass
+# scans a generous window (~500 chars) for any canonical fuel token —
+# grid-style cards (Richmond County VA) print the label row and value row
+# on separate lines AND docTR's reading-order OCR can interleave values
+# from right-side image regions, so the corresponding fuel value can be
+# 5-15 lines below the label rather than immediately after it.
+_HEATFUEL_LABEL_RE = re.compile(
+    r"\b(?:heat\s*fuel|heating\s*fuel|fuel\s*type)\b",
     re.IGNORECASE,
 )
+_HEATFUEL_VALUE_WINDOW = 500
+
+
+_CANONICAL_HEATFUEL_VALUES = {
+    "GAS", "OIL", "ELECTRIC", "PROPANE", "WOOD", "SOLAR", "COAL", "NONE",
+}
 
 
 def _post_extract_heatfuel(data: dict, text: str) -> dict:
@@ -1532,27 +1965,31 @@ def _post_extract_heatfuel(data: dict, text: str) -> dict:
         appears elsewhere on the card and the model conflates a fireplace
         appliance with the heating system.
 
-    When this pass finds a clearly-labeled value, it overwrites whatever
-    the LLM produced. The labeled value is by definition the right answer
-    — it's spelled out in the construction-detail section. We only trust
-    the LLM for heatfuel when the label cell is empty (no canonical-fuel
-    token follows the label).
+    Recovery (LLM emitted no heatfuel): scan a generous window after the
+    fuel label so grid-style cards that print the label row and value row
+    on separate lines (Richmond County VA) can still be read.
+
+    Override (LLM emitted a non-canonical fuel like "ELECTRIC C-AIR"):
+    correct it. If the LLM already has a canonical fuel value, leave it
+    alone — the LLM has full document context and the wide window risks
+    a false positive.
     """
-    for m in _HEATFUEL_LABEL_VALUE_RE.finditer(text):
-        candidate = m.group(1).strip().upper()
+    existing = data.get("heatfuel")
+    if isinstance(existing, str) and existing.strip().upper() in _CANONICAL_HEATFUEL_VALUES:
+        return data
+
+    for m in _HEATFUEL_LABEL_RE.finditer(text):
+        window = text[m.end() : m.end() + _HEATFUEL_VALUE_WINDOW].upper()
         for pattern, canonical in _HEATFUEL_TOKEN_MAP:
-            if re.search(rf"\b{pattern}\b", candidate):
-                existing = data.get("heatfuel")
-                if existing == canonical:
-                    return data
+            if re.search(rf"\b{pattern}\b", window):
                 if existing:
                     logger.warning(
-                        "heatfuel overridden: LLM said %r, label %r says %s",
+                        "heatfuel overridden: LLM said %r, %s label says %s",
                         existing, m.group(0).strip(), canonical,
                     )
                 else:
                     logger.info(
-                        "heatfuel recovered from label: %r -> %s",
+                        "heatfuel recovered from %s label: %s",
                         m.group(0).strip(), canonical,
                     )
                 data["heatfuel"] = canonical
@@ -1560,314 +1997,296 @@ def _post_extract_heatfuel(data: dict, text: str) -> dict:
     return data
 
 
-# Per-field label regex + short retry hint. When a label appears in the
-# markdown but the field is empty after the main extraction (and any
-# deterministic post-processors), the retry below re-asks the LLM in one
-# focused batch. Each pattern is anchored at word boundaries to keep label
-# detection conservative — false positives just trigger an extra LLM call,
-# but false negatives leave fields unfilled.
-_FIELD_RETRY_HINTS: dict[str, tuple[re.Pattern, str]] = {
-    "heatfuel": (
-        re.compile(
-            r"\b(?:heat\s*fuel|heating\s*fuel|fuel\s*type|fuel\s*source|"
-            r"heating\s*source|energy\s*source|heat\s*type|heating\s*system)\b",
-            re.IGNORECASE,
-        ),
-        "Allowed values: GAS, OIL, ELECTRIC, PROPANE, WOOD, SOLAR, COAL, NONE. "
-        "Common abbreviations: 'ELECT'/'ELEC' -> ELECTRIC, 'LP'/'LPG' -> PROPANE, "
-        "'N.G.'/'Natural Gas' -> GAS, 'Fuel Oil' -> OIL.",
-    ),
-    "heating": (
-        re.compile(r"\b(?:heating(?:\s*system|\s*type)?|heat\s*type|hvac\s*system)\b", re.IGNORECASE),
-        "Heating system delivery type (FORCED AIR, HEAT PUMP, BASEBOARD, RADIANT, "
-        "WARMED & COOLED AIR). NOT the fuel.",
-    ),
-    "cooling": (
-        re.compile(r"\b(?:cooling|central\s*air|a\s*/?\s*c\s*type|air\s*condition)\b", re.IGNORECASE),
-        "Cooling system type (CENTRAL AIR, NONE, WINDOW UNIT, HEAT PUMP, etc.).",
-    ),
-    "yearbuilt": (
-        re.compile(
-            r"\b(?:year\s*built|yr\s*blt|original\s*year|year\s*of\s*construction)\b",
-            re.IGNORECASE,
-        ),
-        "Original year built (4-digit integer). NOT effective year, effective age, "
-        "or remodel year.",
-    ),
-    "yearremodel": (
-        re.compile(r"\b(?:year\s*remodel(?:ed)?|yr\s*rmd|remodel\s*year)\b", re.IGNORECASE),
-        "Year of last remodel (4-digit integer).",
-    ),
-    "bldgsqft": (
-        re.compile(
-            r"\b(?:living\s*area|heated\s*s(?:f|q\.?\s*ft)|finished\s*area|"
-            r"total\s*living(?:\s*area)?|main\s*area|total\s*square\s*foot|"
-            r"total\s*area)\b",
-            re.IGNORECASE,
-        ),
-        "Living / heated / finished / main area square footage (integer). "
-        "On Spotsylvania-style cards 'Total Area' is the heated area — use "
-        "it when no Living/Finished label is present. NOT gross building area.",
-    ),
-    "bedrooms": (
-        re.compile(
-            r"\b(?:total\s*bedrooms?|number\s*of\s*bedrooms?|#\s*bedrooms?|bedrooms?)\b",
-            re.IGNORECASE,
-        ),
-        "Bedroom count (integer).",
-    ),
-    "fullbaths": (
-        re.compile(
-            r"\b(?:full\s*baths?|total\s*bathrooms?|number\s*of\s*baths?)\b",
-            re.IGNORECASE,
-        ),
-        "Full bathroom count (integer).",
-    ),
-    "halfbaths": (
-        re.compile(r"\b(?:half\s*baths?|1\s*/\s*2\s*baths?|powder\s*rooms?)\b", re.IGNORECASE),
-        "Half bathroom count (integer).",
-    ),
-    "fireplaces": (
-        re.compile(
-            r"\b(?:#\s*of\s*fireplaces?|number\s*of\s*fireplaces?|fireplaces?)\b",
-            re.IGNORECASE,
-        ),
-        "Fireplace count (integer).",
-    ),
-    "imprvalue": (
-        re.compile(
-            r"\b(?:improvement\s*value|building\s*value|impr\s*value)\b",
-            re.IGNORECASE,
-        ),
-        "Improvement / building value (integer, no commas / $).",
-    ),
-    "landvalue": (
-        re.compile(r"\bland\s*value\b", re.IGNORECASE),
-        "Land value (integer, no commas / $).",
-    ),
-    "totalvalue": (
-        re.compile(r"\b(?:total\s*value|total\s*assessed|grand\s*total)\b", re.IGNORECASE),
-        "Total assessed value (integer, no commas / $).",
-    ),
-    "saleamt": (
-        re.compile(r"\bsale\s*(?:price|amount|amt)\b", re.IGNORECASE),
-        "Most recent sale price (integer). Use the latest transfer only.",
-    ),
-    "saledate": (
-        re.compile(r"\bsale\s*date\b", re.IGNORECASE),
-        "Most recent sale date in YYYY-MM-DD format. Use the latest transfer only.",
-    ),
-    "ownername": (
-        re.compile(r"\b(?:current\s*owner|owner\s*name|primary\s*owner)\b", re.IGNORECASE),
-        "Current owner name (text).",
-    ),
-    "parceladdr": (
-        re.compile(
-            r"\b(?:property\s*(?:address|location)|situs(?:\s*address)?|"
-            r"site\s*address|location\s*address)\b",
-            re.IGNORECASE,
-        ),
-        "Physical property address (text). NOT the owner's mailing address.",
-    ),
-    "legaldesc": (
-        re.compile(r"\b(?:legal\s*description|legal\s*desc)\b", re.IGNORECASE),
-        "Legal description (text).",
-    ),
-    "foundation": (
-        re.compile(r"\bfoundation(?:\s*wall)?\b", re.IGNORECASE),
-        "Foundation type (text).",
-    ),
-    "extwall": (
-        re.compile(r"\bext(?:erior)?\s*wall\b", re.IGNORECASE),
-        "Exterior wall material (text). NOT an interior wall material.",
-    ),
-    "intwall": (
-        re.compile(r"\bint(?:erior)?\s*wall\b", re.IGNORECASE),
-        "Interior wall material (text). NOT an exterior wall material.",
-    ),
-    "roofcover": (
-        re.compile(r"\broof\s*cover\b", re.IGNORECASE),
-        "Roof cover material (text).",
-    ),
-    "roofstyle": (
-        re.compile(r"\broof\s*(?:style|type|shape)\b", re.IGNORECASE),
-        "Roof style (text, e.g. GABLE, HIP, FLAT).",
-    ),
-    "bldgquality": (
-        re.compile(r"\b(?:grade(?:\s*\%)?|building\s*grade|building\s*quality)\b", re.IGNORECASE),
-        "Building grade / quality (text, often a letter or letter+number).",
-    ),
-    "numfloors": (
-        re.compile(
-            r"\b(?:stories|number\s*of\s*floors|num\s*floors|floor\s*count)\b",
-            re.IGNORECASE,
-        ),
-        "Number of floors / stories (integer; round 1.5 -> 1, 2.5 -> 2).",
-    ),
-    "usecode": (
-        re.compile(r"\b(?:property\s*use|use\s*code|land\s*use\s*code)\b", re.IGNORECASE),
-        "Use code (short alphanumeric, e.g. 'R1', '00', '200R').",
-    ),
-    "zoningcode": (
-        re.compile(r"\bzoning(?:\s*code)?\b", re.IGNORECASE),
-        "Zoning code (alphanumeric, typically letter prefix + numeric "
-        "or dashed suffix: e.g. 'SR', 'R-1', 'A1', 'SF-2', 'PUL_R4'). "
-        "Prefer the longer, more specific code when several candidates "
-        "appear — a bare single letter like 'R' is usually a property-"
-        "type abbreviation, not the full zoning code.",
-    ),
+# Roof-style and roof-cover keywords used by `_post_extract_roof`. These
+# are the values county cards print under "Roof Type", "Roof Style",
+# "Roof Material", or "Roof Type/Material" labels.
+_ROOF_STYLE_TOKENS: tuple[tuple[str, str], ...] = (
+    (r"GABLE", "GABLE"),
+    (r"HIP", "HIP"),
+    (r"GAMBREL", "GAMBREL"),
+    (r"MANSARD", "MANSARD"),
+    (r"FLAT", "FLAT"),
+    (r"SHED", "SHED"),
+    (r"DOME", "DOME"),
+    (r"SALTBOX", "SALTBOX"),
+)
+_ROOF_COVER_TOKENS: tuple[tuple[str, str], ...] = (
+    (r"COMP\s*SHGLS?", "COMPOSITION SHINGLES"),
+    (r"COMP(?:OSITION)?\s*SHINGLES?", "COMPOSITION SHINGLES"),
+    (r"ASPHALT\s*SHINGLES?", "ASPHALT SHINGLES"),
+    (r"ASPHALT", "ASPHALT"),
+    (r"WOOD\s*SHGLS?", "WOOD SHINGLES"),
+    (r"WOOD\s*SHINGLES?", "WOOD SHINGLES"),
+    (r"METAL", "METAL"),
+    (r"SLATE", "SLATE"),
+    (r"CLAY\s*TILE", "CLAY TILE"),
+    (r"TILE", "TILE"),
+    (r"RUBBER", "RUBBER"),
+    (r"BUILT\s*UP", "BUILT UP"),
+)
+_ROOF_LABEL_RE = re.compile(
+    r"\bROOF\s*(?:TYPE\s*/\s*MATERIAL|TYPE|MATERIAL|STYLE|COVER)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_roof_cover(value: str) -> bool:
+    """True when the string value matches a roof-cover material keyword."""
+    upper = value.upper()
+    return any(re.search(rf"\b{p}\b", upper) for p, _ in _ROOF_COVER_TOKENS)
+
+
+def _looks_like_roof_style(value: str) -> bool:
+    """True when the string value matches a roof-style keyword."""
+    upper = value.upper()
+    return any(re.search(rf"\b{p}\b", upper) for p, _ in _ROOF_STYLE_TOKENS)
+
+
+def _post_extract_roof(data: dict, text: str) -> dict:
+    """Recover roofstyle / roofcover from a 'Roof Type/Material' label.
+
+    Some assessor cards (e.g. Richmond County VA) print BUILDING
+    PROPERTIES as a label row + a value row, with several columns. The
+    chunked-CSV extractor frequently mis-aligns when the row contains
+    multi-word values ("CRAWL CONCRETE", "GABLE COMP SHGLS"): the LLM
+    fragments multi-word values into separate cells, sliding all
+    subsequent fields one slot. The result is roofstyle/roofcover
+    landing in attic/atticsqft/intwall/extwall, or the two getting
+    swapped (a cover material like "COMP SHGLS" landing in roofstyle).
+
+    Recover roofstyle and roofcover deterministically by scanning the
+    OCR text for known roof-style and roof-cover keywords inside a
+    window after a "Roof" label. If the LLM filled roofstyle with a
+    cover material (or roofcover with a style word), correct it.
+    """
+    m = _ROOF_LABEL_RE.search(text)
+    if not m:
+        return data
+    region = text[m.end() : m.end() + 300].upper()
+
+    existing_style = data.get("roofstyle")
+    style_invalid = (
+        isinstance(existing_style, str)
+        and _looks_like_roof_cover(existing_style)
+        and not _looks_like_roof_style(existing_style)
+    )
+    if not existing_style or style_invalid:
+        for pattern, canonical in _ROOF_STYLE_TOKENS:
+            if re.search(rf"\b{pattern}\b", region):
+                if style_invalid:
+                    logger.warning(
+                        "roofstyle overridden: LLM said %r (looks like a cover), "
+                        "ROOF label region says %s",
+                        existing_style, canonical,
+                    )
+                else:
+                    logger.info(
+                        "roofstyle recovered from ROOF label: %s", canonical,
+                    )
+                data["roofstyle"] = canonical
+                break
+
+    existing_cover = data.get("roofcover")
+    cover_invalid = (
+        isinstance(existing_cover, str)
+        and _looks_like_roof_style(existing_cover)
+        and not _looks_like_roof_cover(existing_cover)
+    )
+    if not existing_cover or cover_invalid:
+        for pattern, canonical in _ROOF_COVER_TOKENS:
+            if re.search(rf"\b{pattern}\b", region):
+                if cover_invalid:
+                    logger.warning(
+                        "roofcover overridden: LLM said %r (looks like a style), "
+                        "ROOF label region says %s",
+                        existing_cover, canonical,
+                    )
+                else:
+                    logger.info(
+                        "roofcover recovered from ROOF label: %s", canonical,
+                    )
+                data["roofcover"] = canonical
+                break
+
+    return data
+
+
+# Anchor for a "Zoning" label in the OCR text. The value can either
+# follow inline ("Zoning: A-1") or sit several columns down on the
+# value row beneath a multi-column label header ("...UTILITIES ZONING
+# CLASS\n...Electric A-1 2"). The post-pass scans a window after the
+# label for the first plausible zoning-code token.
+_ZONING_LABEL_RE = re.compile(r"\bzoning\b", re.IGNORECASE)
+# A real zoning classification: letter prefix + digit (with optional
+# dashes / extra letters) OR a known all-letter code. The first-letter
+# word boundary keeps us from matching a bare number or a 4-digit zip.
+_ZONING_CODE_RE = re.compile(
+    r"\b(?:[A-Z]{1,4}-\d[A-Z\d-]*|[A-Z]{1,4}\d[A-Z\d-]*|PUD|PUL[_A-Z\d]*)\b",
+    re.IGNORECASE,
+)
+# Tokens that look like zoning codes but are not — appear adjacent to
+# the zoning label on Richmond-style cards as column headers / class
+# numbers. Skip these and keep scanning.
+_ZONING_BLOCKLIST = {
+    "CLASS", "CODE", "DESC", "DESCRIPTION",
 }
 
 
-# Canonical heatfuel set used to normalize the LLM's retry response.
-_CANONICAL_HEATFUEL = {"GAS", "OIL", "ELECTRIC", "PROPANE", "WOOD", "SOLAR", "COAL", "NONE"}
+def _post_extract_zoning(data: dict, text: str) -> dict:
+    """Recover zoningcode from an explicit ZONING / Zoning Code label.
 
+    The chunked-CSV extractor occasionally drops zoningcode when the
+    LLM is unsure which short token next to the label is the zoning
+    code (cards often have a class or use code adjacent to it). When
+    that happens, fall back to a label-anchored regex match.
 
-def _normalize_heatfuel(value: str) -> str | None:
-    """Map a free-form heatfuel string to its canonical value if possible."""
-    if not isinstance(value, str):
-        return None
-    candidate = value.strip().upper()
-    if not candidate:
-        return None
-    if candidate in _CANONICAL_HEATFUEL:
-        return candidate
-    for pattern, mapped in _HEATFUEL_TOKEN_MAP:
-        if re.fullmatch(pattern, candidate):
-            return mapped
-    return None
-
-
-MISSING_FIELDS_RETRY_PROMPT = """\
-The property card text below carries labels for fields that were NOT filled
-in on the first extraction pass. Re-read the card and fill in any of the
-fields below that you can confidently determine.
-
-Missing fields with hints:
-{field_block}
-
-CRITICAL rules — read carefully:
-- A label being PRESENT does NOT mean the field has a value. If the label's
-  value cell is blank, empty, dashed, or whitespace, OMIT that field. Do
-  NOT guess and do NOT borrow a value from a nearby cell.
-- Each field must come from its OWN labeled cell on the card. Never reuse
-  a value from one field as the value for another (e.g. a "Primary Use"
-  code is never a "Zoning Code", a "Year Remodeled" is never the
-  "Year Built").
-- "NONE" is a real value, NOT a placeholder. Only emit "NONE" for a field
-  when the card EXPLICITLY shows the literal text "NONE" (or "None") as
-  that field's value. If the cell is blank, dashed, or empty, OMIT the
-  field — do not substitute "NONE" / "N/A" / "UNKNOWN" / "" / 0.
-- Return ONLY a JSON object containing only the fields you can confidently
-  fill in. Numeric fields must be numbers (no $, no commas). Dates must be
-  YYYY-MM-DD.
-- If you cannot confidently determine ANY of these fields, return {{}}.
-
-PROPERTY CARD TEXT:
-{document_text}
-"""
-
-
-def _retry_missing_labeled_fields(data: dict, text: str) -> dict:
-    """Re-query the LLM for any field whose label appears in the OCR text
-    but was not filled in by the main extraction.
-
-    Catches the common failure mode where individual fields get dropped
-    under context noise — a busy OCR'd construction-detail block buries
-    individual values, but the labels are right there. By naming the
-    missing fields explicitly we focus the model's attention.
-
-    Already-populated values are never overwritten.
+    Search window is wide (~150 chars) because grid-style cards print
+    label rows and value rows on separate lines, with the zoning value
+    several columns down the value row.
     """
-    missing: list[tuple[str, str]] = []
-    for field, (label_re, hint) in _FIELD_RETRY_HINTS.items():
-        existing = data.get(field)
-        if existing not in (None, ""):
+    if data.get("zoningcode"):
+        return data
+    m = _ZONING_LABEL_RE.search(text)
+    if not m:
+        return data
+    region = text[m.end() : m.end() + 150]
+    for cm in _ZONING_CODE_RE.finditer(region):
+        candidate = cm.group(0).strip().upper()
+        if candidate in _ZONING_BLOCKLIST:
             continue
-        if label_re.search(text):
-            missing.append((field, hint))
-
-    if not missing:
+        data["zoningcode"] = candidate
+        logger.info("zoningcode recovered from ZONING label: %s", candidate)
         return data
+    return data
 
-    field_block = "\n".join(f"  {f}: {h}" for f, h in missing)
-    logger.warning(
-        "Missing-field retry: %d labeled field(s) unfilled: %s",
-        len(missing), ", ".join(f for f, _ in missing),
-    )
 
-    try:
-        full_text = _stream_llm(
-            [{"role": "user", "content": MISSING_FIELDS_RETRY_PROMPT.format(
-                field_block=field_block, document_text=text,
-            )}],
-            label="missing-fields-retry",
-        )
-    except Exception as e:
-        logger.warning("Missing-field retry failed (%s); leaving fields unset", e)
+def _recover_heatfuel_from_hvac_chunk(data: dict) -> dict:
+    """Move a fuel-name value out of heating/cooling and into heatfuel.
+
+    The HVAC chunk (heating, heatfuel, cooling) is the easiest one for the
+    LLM to misalign: it's only three cells, and a missed comma puts a fuel
+    name in the cooling slot or a delivery-system name in the heatfuel
+    slot. Concrete patterns observed on Richmond County VA:
+      HVAC:,,ELECTRIC,   (heating empty, heatfuel empty, cooling=ELECTRIC)
+      HVAC:ELECTRIC,ELECTRIC,   (LLM duplicated the fuel into heating)
+
+    When heatfuel is missing and another HVAC slot holds a canonical fuel
+    name, that's almost certainly a misalignment. Move the value over.
+    """
+    if data.get("heatfuel"):
         return data
-
-    try:
-        raw = _parse_json_response(full_text)
-    except json.JSONDecodeError:
-        logger.warning("Missing-field retry returned non-JSON; leaving fields unset")
-        return data
-
-    if not isinstance(raw, dict):
-        return data
-
-    requested = {f for f, _ in missing}
-    restricted = {k: v for k, v in raw.items() if k in requested}
-
-    # Heatfuel needs canonical normalization since the LLM may emit "ELECT".
-    if "heatfuel" in restricted:
-        normalized = _normalize_heatfuel(str(restricted["heatfuel"]))
-        if normalized is None:
-            logger.warning(
-                "heatfuel retry returned non-canonical %r; dropping", restricted["heatfuel"],
+    for src in ("cooling", "heating"):
+        v = data.get(src)
+        if not isinstance(v, str):
+            continue
+        canonical = v.strip().upper()
+        if canonical in _CANONICAL_HEATFUEL_VALUES:
+            data["heatfuel"] = canonical
+            del data[src]
+            logger.info(
+                "heatfuel recovered from misplaced %s value: %s",
+                src, canonical,
             )
-            del restricted["heatfuel"]
-        else:
-            restricted["heatfuel"] = normalized
+            return data
+    return data
 
-    coerced = _coerce_types(restricted)
 
-    # Reject retry values that collide with an already-extracted value for a
-    # different field. This is the LLM's main misallocation failure mode:
-    # when it can't find the labeled value, it falls back to a nearby cell
-    # (e.g. emitting Primary Use as zoningcode). Comparing as upper-case
-    # strings catches both numeric-as-string and case-folded matches.
-    existing_values = {
-        str(v).strip().upper()
-        for k, v in data.items()
-        if k not in coerced and v not in (None, "")
-    }
+def _post_extract_heating_cooling_codes(data: dict, text: str) -> dict:
+    """Set heating=CENTRAL / cooling=CENTRAL AIR from 'C-HEAT' / 'C-AIR' codes.
 
-    added: list[str] = []
-    rejected: list[str] = []
-    for k, v in coerced.items():
-        if data.get(k) not in (None, ""):
-            continue
-        if str(v).strip().upper() in existing_values:
-            rejected.append(f"{k}={v!r} (collides with another field)")
-            continue
-        data[k] = v
-        added.append(k)
+    Richmond County VA cards encode HVAC in the BUILDING SECTIONS row as
+    bare codes (e.g. "C-HEAT" for central heat, "C-AIR" for central air).
+    Those codes are unambiguous when present. Override the LLM only when
+    its value is missing or is clearly a fuel name accidentally placed
+    in the heating/cooling slot (the chunked-CSV extractor occasionally
+    puts the fuel where heating or cooling belongs because the columns
+    share a row).
+    """
+    has_c_heat = bool(re.search(r"\bC[-\s]+HEAT\b", text, re.IGNORECASE))
+    has_c_air = bool(re.search(r"\bC[-\s]+AIR\b", text, re.IGNORECASE))
 
-    if added:
-        logger.info(
-            "Missing-field retry recovered %d field(s): %s",
-            len(added), ", ".join(f"{k}={data[k]!r}" for k in added),
-        )
-    if rejected:
-        logger.warning(
-            "Missing-field retry rejected %d field(s): %s",
-            len(rejected), "; ".join(rejected),
-        )
-    if not added and not rejected:
-        logger.info("Missing-field retry yielded no usable fields")
+    if has_c_heat:
+        existing = data.get("heating")
+        if not existing or (
+            isinstance(existing, str)
+            and existing.strip().upper() in _CANONICAL_HEATFUEL_VALUES
+        ):
+            if existing:
+                logger.warning(
+                    "heating overridden from C-HEAT signal: %r -> CENTRAL",
+                    existing,
+                )
+            else:
+                logger.info("heating recovered from C-HEAT signal: CENTRAL")
+            data["heating"] = "CENTRAL"
+
+    if has_c_air:
+        existing = data.get("cooling")
+        if not existing or (
+            isinstance(existing, str)
+            and existing.strip().upper() in _CANONICAL_HEATFUEL_VALUES
+        ):
+            if existing:
+                logger.warning(
+                    "cooling overridden from C-AIR signal: %r -> CENTRAL AIR",
+                    existing,
+                )
+            else:
+                logger.info(
+                    "cooling recovered from C-AIR signal: CENTRAL AIR",
+                )
+            data["cooling"] = "CENTRAL AIR"
 
     return data
+
+
+# Values that signal a STRUCT-chunk slot was filled with a value from a
+# neighbouring slot — typically because the LLM fragmented a multi-word
+# cell ("CRAWL CONCRETE", "GABLE COMP SHGLS") and shifted later cells
+# one position to the right.
+_NON_ATTIC_VALUES = {
+    "GABLE", "HIP", "FLAT", "GAMBREL", "MANSARD", "SHED", "DOME",
+    "SALTBOX",
+    "CONCRETE", "BRICK", "STONE", "BLOCK", "SLAB", "PIER",
+    "COMP", "COMP SHGLS", "COMP SHINGLES", "COMPOSITION SHINGLES",
+    "METAL", "ASPHALT", "ASPHALT SHINGLES", "SHINGLES", "TILE",
+    "SLATE", "RUBBER",
+    "DRY WALL", "DRYWALL", "PLASTER", "PANELING",
+}
+_NON_EXTWALL_VALUES = {
+    "COMP", "COMP SHGLS", "COMP SHINGLES", "COMPOSITION SHINGLES",
+    "ASPHALT SHINGLES", "ASPHALT", "METAL SHINGLES", "TILE", "SLATE",
+    "RUBBER", "GABLE", "HIP", "FLAT", "GAMBREL", "MANSARD",
+}
+
+
+def _strip_misplaced_struct_values(data: dict) -> dict:
+    """Drop STRUCT-chunk values that obviously belong to a different slot.
+
+    The chunked-CSV extractor occasionally fragments multi-word cells in
+    BUILDING PROPERTIES rows ("CRAWL CONCRETE", "GABLE COMP SHGLS"),
+    sliding values into the wrong slots. The downstream
+    `_post_extract_roof` recovers roofstyle/roofcover from text, so the
+    contaminated values in attic/extwall are now redundant — drop them
+    rather than letting them propagate.
+    """
+    attic = data.get("attic")
+    if isinstance(attic, str) and attic.strip().upper() in _NON_ATTIC_VALUES:
+        logger.info(
+            "attic value %r looks like a non-attic material; dropping", attic,
+        )
+        del data["attic"]
+
+    extwall = data.get("extwall")
+    if isinstance(extwall, str) and extwall.strip().upper() in _NON_EXTWALL_VALUES:
+        logger.info(
+            "extwall value %r looks like a roof cover/style; dropping", extwall,
+        )
+        del data["extwall"]
+
+    return data
+
+
 
 
 def _infer_heating_from_central_air(data: dict, text: str) -> dict:
@@ -1966,9 +2385,13 @@ def extract_data(state: AgentState) -> dict:
     data = _run_extraction_llm(text, state.get("context"))
     data = _reconcile_value_totals(data)
     data = _retry_parcelid(data, text)
+    data = _recover_heatfuel_from_hvac_chunk(data)
     data = _post_extract_heatfuel(data, text)
-    data = _retry_missing_labeled_fields(data, text)
+    data = _post_extract_heating_cooling_codes(data, text)
     data = _infer_heating_from_central_air(data, text)
+    data = _post_extract_zoning(data, text)
+    data = _post_extract_roof(data, text)
+    data = _strip_misplaced_struct_values(data)
     data = _drop_unverified_none(data, text)
     logger.info("Extracted %d fields from PDF text", len(data))
     return {"property_data": data}
